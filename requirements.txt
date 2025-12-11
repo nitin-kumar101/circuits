@@ -2,3 +2,69 @@ numpy>=1.24.0
 opencv-python-headless>=4.8.0
 PyMuPDF>=1.23.0
 
+import base64
+import json
+import os
+
+# You’ll need the tiktoken library (works with OpenAI-style tokenization rules)
+# pip install tiktoken
+import tiktoken
+
+def estimate_image_tokens_and_cost(
+    image_path: str,
+    model_name: str = "sonnet-4",
+    cost_per_1000_tokens: float = 0.06,
+    instruction_text: str = None
+):
+    """
+    Estimate number of tokens needed to send the image (encoded) + optional instruction_text
+    to the given model, and compute estimated cost.
+    
+    Args:
+      image_path: Path to the local image file.
+      model_name: Name of the model — used to pick a tokenizer if needed.
+      cost_per_1000_tokens: Cost in dollars (or whichever currency) per 1,000 tokens for the model.
+      instruction_text: Optional textual prompt or instruction you send along with the image.
+    
+    Returns:
+      tuple(token_count:int, estimated_cost: float)
+    """
+    # Read and base64-encode the image
+    with open(image_path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode("ascii")
+    
+    # Build a dummy request payload
+    content = f"[Image in base64: {b64}]"
+    if instruction_text:
+        content = instruction_text + "\n" + content
+    
+    messages = [
+        {"role": "user", "content": content}
+    ]
+    payload = {
+        "model": model_name,
+        "messages": messages
+    }
+    payload_str = json.dumps(payload)
+    
+    # Use tiktoken to estimate tokens
+    # Adjust tokenizer name depending on model; e.g. 'gpt-4' uses 'cl100k_base'
+    # If "sonnet-4" is custom, pick closest matching model tokenizer
+    enc = tiktoken.get_encoding("cl100k_base")
+    tokens = len(enc.encode(payload_str))
+    
+    cost = tokens / 1000 * cost_per_1000_tokens
+    return tokens, cost
+
+if __name__ == "__main__":
+    image_path = "your_image.jpg"         # change to your file
+    # Example cost: suppose Sonnet-4 charges $0.06 / 1,000 tokens
+    tokens, cost = estimate_image_tokens_and_cost(
+        image_path,
+        model_name="sonnet-4",
+        cost_per_1000_tokens=0.06,
+        instruction_text="Describe what is in this image."
+    )
+    print(f"Estimated tokens: {tokens}")
+    print(f"Estimated cost: ${cost:.4f}")
