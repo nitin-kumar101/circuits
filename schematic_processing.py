@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-schematic_graph_v4.py
+schematic_graph_v5.py
 
-Generic, fast schematic connectivity extractor for vector PDF schematics.
+Generic, fast schematic connectivity extractor for vector PDF schematics, including dense pin-table / BGA-style pages.
 
 Design goals
 ------------
@@ -25,6 +25,10 @@ Outputs
 <prefix>_unresolved_components.csv
 <prefix>_net_labels.csv
 <prefix>_summary.json
+<prefix>_pin_records.csv
+<prefix>_pin_tables.csv
+<prefix>_external_links.csv
+<prefix>_page_text.csv
 optional: <prefix>_overview.png
 
 Usage
@@ -60,6 +64,18 @@ MIN_SEGMENT = 1.5
 MAX_WIRE_ANGLE_DEG = 4.0
 MAX_BORDER_FRACTION = 0.86
 GRID_CELL = 12.0
+
+# Dense IC/BGA/pin-table extraction. These pages often contain rows such as:
+#   113_15  2_CCM_CLK1_N  P13  CCM_CLK1_N
+# or the mirrored order:
+#   CCM_CLK1_N  P13  2_CCM_CLK1_N  113_15
+# We treat these as structured pin records rather than ordinary text labels.
+PIN_ROW_Y_TOL = 3.2
+PIN_COLUMN_TOL = 5.0
+MIN_PIN_TABLE_ROWS = 8
+PIN_COORD_RE = re.compile(r"^[A-Z]{1,3}\d{1,4}$", re.I)
+EXTERNAL_ID_RE = re.compile(r"^\d{1,5}[_-]\d{1,5}$")
+PIN_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_#./+\-]*$")
 
 # Common reference designators. The parser is deliberately conservative:
 # arbitrary capital words are not components.
@@ -143,6 +159,20 @@ class NetLabel:
     x: float
     y: float
     source: str = "visible-text"
+
+
+@dataclass
+class PinRecord:
+    page: int
+    block: str
+    pin_name: str
+    pin_number: str
+    net: str = ""
+    external_id: str = ""
+    side: str = "unknown"
+    row_y: float = 0.0
+    x: float = 0.0
+    evidence: str = "row-aligned"
 
 
 @dataclass
@@ -448,6 +478,9 @@ class Extractor:
         self.cluster_labels: dict[tuple[int, int], set[str]] = defaultdict(set)
         self.component_nets: list[dict] = []
         self.unresolved: list[dict] = []
+        self.pin_records: list[PinRecord] = []
+        self.pin_tables: list[dict] = []
+        self.external_links: list[dict] = []
         self.graph = nx.Graph()
         self.stats = {}
 
@@ -473,6 +506,7 @@ class Extractor:
                 print(f"page {pi:>2}/{len(self.doc)}: text={len(words):>4}, vector-lines={len(self.segments[pi]):>5}, wire-clusters={len(clusters):>4}")
 
         self._extract_components_and_labels()
+        self._extract_pin_tables()
         self._attach_labels()
         self._attach_components()
         self._build_graph()
@@ -523,6 +557,229 @@ class Extractor:
             if key not in seen:
                 seen.add(key); unique.append(n)
         self.net_labels = unique
+
+    # --------------------- structured pin-table extraction ---------------------
+    def _row_groups(self, words):
+        """Group PDF text items into horizontal rows using baseline proximity."""
+        rows = []
+        for w in sorted(words, key=lambda z: (z.cy, z.x0)):
+            placed = False
+            for row in rows[-3:]:
+                if abs(w.cy - row[0].cy) <= PIN_ROW_Y_TOL:
+                    row.append(w)
+                    placed = True
+                    break
+            if not placed:
+                rows.append([w])
+        for row in rows:
+            row.sort(key=lambda z: z.x0)
+        return rows
+
+    @staticmethod
+    def _is_pin_coord(text):
+        return bool(PIN_COORD_RE.fullmatch(text.strip()))
+
+    @staticmethod
+    def _is_external_id(text):
+        return bool(EXTERNAL_ID_RE.fullmatch(text.strip()))
+
+    @staticmethod
+    def _pin_name_candidate(text):
+        t = text.strip()
+        if not t or len(t) > 80:
+            return False
+        if Extractor._is_pin_coord(t) or Extractor._is_external_id(t):
+            return False
+        if parse_ref(t):
+            return False
+        if t.upper() in {"SITE1", "SITE2", "SITE3", "SITE4", "GND", "POWER", "INPUT", "OUTPUT"}:
+            return False
+        if not PIN_NAME_RE.fullmatch(t):
+            return False
+        # Pin names in these blocks are normally signal-like, not prose.
+        return ("_" in t or "#" in t or "-" in t or any(c.isdigit() for c in t)
+                or t.upper() == t)
+
+    @staticmethod
+    def _looks_structured_net(text):
+        t = text.strip()
+        if not t or Extractor._is_pin_coord(t) or Extractor._is_external_id(t):
+            return False
+        return likely_net(t)
+
+    def _family_body_rect(self, page, items):
+        """Return a large body rectangle containing the pin-name/coord columns."""
+        rects = self.body_rects.get(page, [])
+        if not rects:
+            return None
+        pts = [(c["coord"].cx, c["coord"].cy) for c in items]
+        # The screenshot-style blocks have a large rectangular body with the
+        # pin names and pin coordinates inside it. Require strong containment.
+        for r in rects:
+            if r.width < 80 or r.height < 60:
+                continue
+            inside = sum(r.x0-3 <= x <= r.x1+3 and r.y0-3 <= y <= r.y1+3 for x,y in pts)
+            if inside / max(1, len(pts)) >= 0.80:
+                return r
+        return None
+
+    def _extract_pin_tables(self):
+        """Extract dense IC/BGA/site pin rows from repeated aligned columns.
+
+        Important distinction: a token such as ``R295`` or ``X1`` can look like
+        a BGA coordinate syntactically. We therefore never accept one row in
+        isolation. A pin table must form a repeated column pattern over at least
+        MIN_PIN_TABLE_ROWS rows. This is what makes the detector conservative on
+        ordinary schematic pages while still handling pages like SITE2.
+        """
+        raw = []
+        for pi, words in self.text.items():
+            rows = self._row_groups(words)
+            for row in rows:
+                if len(row) < 2:
+                    continue
+                coords = [w for w in row
+                          if self._is_pin_coord(w.text) and not parse_ref(w.text)]
+                if not coords:
+                    continue
+                for coord in coords:
+                    pin_names = [w for w in row
+                                 if w is not coord and self._pin_name_candidate(w.text)]
+                    if not pin_names:
+                        continue
+                    pin = min(pin_names, key=lambda w: abs(w.cx-coord.cx))
+                    nets = [w for w in row
+                            if w is not coord and w is not pin and self._looks_structured_net(w.text)]
+                    exts = [w for w in row if self._is_external_id(w.text)]
+                    netw = None
+                    if nets:
+                        # Avoid selecting a component value / reference when a
+                        # stronger signal-looking label is available.
+                        nets.sort(key=lambda w: (
+                            not ("_" in w.text or "#" in w.text or re.match(r"^\\d+_", w.text)),
+                            abs(w.cx-coord.cx)))
+                        netw = nets[0]
+                    extw = min(exts, key=lambda w: abs(w.cx-coord.cx)) if exts else None
+                    if netw is None and extw is None:
+                        continue
+                    raw.append({
+                        "page": pi, "pin": pin, "coord": coord,
+                        "netw": netw, "extw": extw,
+                    })
+
+        # Build repeated column families. A real pin-table has stable x-columns:
+        # [external-id, net, pin-coordinate, pin-name] or the mirror image.
+        families = defaultdict(list)
+        for c in raw:
+            pi = c["page"]
+            q = lambda v: round(v / PIN_COLUMN_TOL)
+            key = (
+                pi,
+                q(c["coord"].cx),
+                q(c["pin"].cx),
+            )
+            families[key].append(c)
+
+        accepted = []
+        accepted_rects = {}
+        for key, items in families.items():
+            # Rows must be distinct vertically; duplicate PDF text objects do not
+            # count toward the table size.
+            unique_y = sorted({round(c["coord"].cy, 1) for c in items})
+            if len(unique_y) < MIN_PIN_TABLE_ROWS:
+                continue
+            # Reject a family spanning a huge vertical area with only a handful
+            # of rows; dense pin tables have regular row spacing.
+            diffs = [b-a for a, b in zip(unique_y, unique_y[1:]) if b-a > 0]
+            if diffs:
+                med = sorted(diffs)[len(diffs)//2]
+                if med > 18.0:
+                    continue
+            body = self._family_body_rect(key[0], items)
+            if body is None:
+                continue
+            accepted.extend(items)
+            accepted_rects[key] = body
+
+        # Convert accepted candidates to records.
+        for c in accepted:
+            coord, pin, netw, extw = c["coord"], c["pin"], c["netw"], c["extw"]
+            side = "left" if pin.cx > coord.cx else "right"
+            if netw is not None:
+                side = "left" if netw.cx < coord.cx else "right"
+            self.pin_records.append(PinRecord(
+                page=c["page"], block="", pin_name=pin.text.strip(),
+                pin_number=coord.text.strip(),
+                net=(netw.text.strip() if netw else ""),
+                external_id=(extw.text.strip() if extw else ""),
+                side=side, row_y=round(coord.cy, 3), x=round(coord.cx, 3),
+                evidence="repeated-aligned-pin-table",
+            ))
+
+        # Deduplicate exact records.
+        seen = set(); uniq = []
+        for r in self.pin_records:
+            key = (r.page, r.pin_name, r.pin_number, r.net, r.external_id,
+                   round(r.row_y, 1), round(r.x, 1))
+            if key not in seen:
+                seen.add(key); uniq.append(r)
+        self.pin_records = uniq
+
+        # Partition records into physical table groups by page/side and nearby
+        # rows. This does not require a detected rectangle; some PDFs draw only
+        # the vertical block boundary.
+        for pi in sorted({r.page for r in self.pin_records}):
+            page_recs = [r for r in self.pin_records if r.page == pi]
+            page_recs.sort(key=lambda r: (r.side, r.x, r.row_y))
+            groups = []
+            for r in page_recs:
+                placed = False
+                for g in reversed(groups[-12:]):
+                    if g[0].side != r.side:
+                        continue
+                    if abs(g[0].x-r.x) > PIN_COLUMN_TOL:
+                        continue
+                    if abs(r.row_y-g[-1].row_y) <= 25:
+                        g.append(r); placed = True; break
+                if not placed:
+                    groups.append([r])
+            gi = 0
+            for g in groups:
+                if len(g) < MIN_PIN_TABLE_ROWS:
+                    continue
+                gi += 1
+                # Find a nearby heading, preferring SITE names and short uppercase
+                # labels. Otherwise use a stable generated table identifier.
+                y0 = min(r.row_y for r in g); x0 = sum(r.x for r in g)/len(g)
+                words = self.text[pi]
+                headings = []
+                for w in words:
+                    t = w.text.strip()
+                    if not t or len(t) > 32 or parse_ref(t):
+                        continue
+                    if abs(w.cx-x0) > 260 or w.cy > y0 + 25 or w.cy < y0 - 220:
+                        continue
+                    if t.upper().startswith("SITE") or (t.upper() == t and len(t) <= 20):
+                        headings.append((abs(w.cy-y0) - min(40, w.size), w))
+                block = min(headings, key=lambda z: z[0])[1].text.strip() if headings else f"PIN_TABLE_P{pi}_{gi}"
+                # Ensure uniqueness if the same heading is used on two sides.
+                if any(t["page"] == pi and t["block"] == block for t in self.pin_tables):
+                    block = f"{block}_{gi}"
+                for r in g:
+                    r.block = block
+                self.pin_tables.append({
+                    "page": pi, "block": block, "rows": len(g),
+                    "y_min": round(min(r.row_y for r in g), 3),
+                    "y_max": round(max(r.row_y for r in g), 3),
+                    "side_counts": dict(Counter(r.side for r in g)),
+                })
+
+        self.external_links = [{
+            "page": r.page, "block": r.block, "pin_name": r.pin_name,
+            "pin_number": r.pin_number, "net": r.net,
+            "external_id": r.external_id, "side": r.side,
+            "evidence": r.evidence,
+        } for r in self.pin_records if r.external_id or r.net]
 
     def _attach_labels(self):
         for label in self.net_labels:
@@ -639,6 +896,9 @@ class Extractor:
             "component_edges": len(self.component_edges()),
             "graph_nodes": self.graph.number_of_nodes() if self.graph else 0,
             "graph_edges": self.graph.number_of_edges() if self.graph else 0,
+            "pin_records": len(self.pin_records),
+            "pin_tables": len(self.pin_tables),
+            "external_links": len(self.external_links),
         }
 
     # ------------------------------ exports ------------------------------
@@ -651,6 +911,9 @@ class Extractor:
             "component_nets": self.component_nets,
             "component_edges": self.component_edges(),
             "unresolved_components": self.unresolved,
+            "pin_records": [r.__dict__ for r in self.pin_records],
+            "pin_tables": self.pin_tables,
+            "external_links": self.external_links,
         }
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -690,6 +953,32 @@ class Extractor:
         wc, _ = self._nearest_cluster_fast(label.page, label.x, label.y, LABEL_WIRE_TOL)
         return wc.cluster_id if wc else -1
 
+    def export_pin_csvs(self, prefix):
+        prefix = Path(prefix)
+        with open(str(prefix) + "_pin_records.csv", "w", newline="", encoding="utf-8") as f:
+            fields = ["page", "block", "pin_name", "pin_number", "net", "external_id", "side", "row_y", "x", "evidence"]
+            w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
+            for r in self.pin_records:
+                w.writerow(r.__dict__)
+
+        with open(str(prefix) + "_pin_tables.csv", "w", newline="", encoding="utf-8") as f:
+            fields = ["page", "block", "rows", "y_min", "y_max", "side_counts"]
+            w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
+            for r in self.pin_tables:
+                rr = dict(r); rr["side_counts"] = json.dumps(rr["side_counts"], sort_keys=True)
+                w.writerow(rr)
+
+        with open(str(prefix) + "_external_links.csv", "w", newline="", encoding="utf-8") as f:
+            fields = ["page", "block", "pin_name", "pin_number", "net", "external_id", "side", "evidence"]
+            w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(self.external_links)
+
+        with open(str(prefix) + "_page_text.csv", "w", newline="", encoding="utf-8") as f:
+            fields = ["page", "text", "x0", "y0", "x1", "y1", "size"]
+            w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
+            for pi, words in self.text.items():
+                for item in words:
+                    w.writerow({"page": pi, **item.__dict__})
+
     def export_summary(self, path):
         Path(path).write_text(json.dumps(self.summary(), indent=2), encoding="utf-8")
 
@@ -714,7 +1003,7 @@ class Extractor:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("pdf", help="input schematic PDF")
-    ap.add_argument("--out-prefix", default="schematic_v4")
+    ap.add_argument("--out-prefix", default="schematic_v5")
     ap.add_argument("--viz", action="store_true")
     args = ap.parse_args()
 
@@ -724,6 +1013,7 @@ def main():
     ex.export_json(str(out) + ".json")
     ex.export_graphml(str(out) + ".graphml")
     ex.export_csvs(out)
+    ex.export_pin_csvs(out)
     ex.export_summary(str(out) + "_summary.json")
     if args.viz:
         ex.export_overview(str(out) + "_overview.png")
