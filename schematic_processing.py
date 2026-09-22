@@ -1,820 +1,1035 @@
+#!/usr/bin/env python3
 """
-schematic_graph.py
-===================
+Schematic graph extractor v3
 
-Reconstruct a full connectivity netlist (components <-> pins <-> nets)
-from a *vector-drawn* schematic PDF, using the same visual conventions
-an engineer reading the schematic would use. Generalized to work on any
-schematic export (Altium, KiCad, OrCAD, Eagle, ...) that draws wires as
-real vector line segments - no tool-specific metadata required.
+Designed for vector PDFs exported from EDA tools (especially Altium-style PDFs).
 
-THE ELECTRICAL RULES THIS ENCODES
-----------------------------------
-A schematic is a *drawing*; a netlist is the *truth* underneath it. The
-rules a human uses to go from one to the other are:
+Core principle:
+  1. Prefer embedded schematic metadata (PI..., NL..., PO..., CO... tokens) when present.
+  2. Use vector wire geometry to reconstruct physical nets.
+  3. Use pin metadata locations rather than guessing pins from component proximity.
+  4. Treat wire crossings conservatively: an intersection is a connection only when
+     a wire endpoint/T-junction reaches it. A pure crossing is NOT merged.
+  5. Use visible/embedded net labels and power labels to merge nets across pages.
+  6. Never invent a connection when evidence is insufficient; unresolved pins are
+     reported separately.
 
-1. Two wire segments that touch **end-to-end** (a corner / L-bend) are
-   the same wire.
-2. A wire segment whose end lands on the **interior** of another segment
-   (a "T") is electrically joined to it - this is how most tools draw a
-   branch/tap without a junction dot.
-3. Two wires that visually **cross but neither ends there** are *NOT*
-   connected, UNLESS a filled junction dot is drawn at the crossing -
-   the dot is what tells you "these four arms are one node", otherwise
-   it's just one wire jumping over another on paper.
-4. A **net name label** placed on a wire stub names that wire. Two wire
-   runs anywhere in the document (even on different sheets) that carry
-   the same net name are the same electrical net - multi-sheet
-   schematics rely on this instead of redrawing the wire across pages.
-5. A component is connected to whatever net its pins/symbol body touch.
+Outputs:
+  <prefix>.graphml
+  <prefix>.json
+  <prefix>_component_nets.csv
+  <prefix>_component_edges.csv
+  <prefix>_unresolved_pins.csv
+  <prefix>_net_aliases.csv
+  optional: <prefix>_overview.png
 
-This module implements exactly these five rules geometrically:
-  - endpoint-to-endpoint joining (rule 1)
-  - endpoint-to-segment-interior joining (rule 2)
-  - junction-dot-triggered joining at true crossings (rule 3)
-  - net-name-label -> wire-cluster attachment, merged by name across the
-    whole document (rule 4)
-  - component-body / refdes-label -> wire-cluster proximity linking,
-    annotated with the nearest pin-number label when one is found
-    (rule 5)
+Run:
+  python schematic_graph_v3.py input.pdf --out-prefix schematic --viz
 
-WHAT IT DOES NOT DO
---------------------
-It cannot recover a manufacturer's internal pin-to-symbol-pad mapping
-beyond what's printed on the sheet - if the sheet prints it (most do),
-this module captures it as a pin label on the connecting edge. It also
-can't perfectly separate two different components whose symbols happen
-to overlap in the drawing; this is a best-effort geometric
-reconstruction, not a verified netlist.
-
-Some EDA tools (e.g. Altium) additionally embed an invisible,
-click-to-highlight netlist as overlapping text runs stacked at the same
-coordinates. That data is real but not reliably recoverable through
-ordinary text extraction (overlapping runs interleave character-by-
-character) and isn't present in exports from other tools, so this
-module doesn't depend on it - everything here is derived from the
-geometry any vector schematic PDF contains.
-
-USAGE
------
-    from schematic_graph import SchematicGraphBuilder
-
-    builder = SchematicGraphBuilder("schematic.pdf")
-    builder.parse()
-    graph = builder.build_graph()
-
-    builder.export_graphml("out.graphml")
-    builder.export_json("out.json")
-    builder.export_component_net_table("out_connections.csv")
-    builder.summary()
-
-    builder.net_of("U36")                       # nets a component touches
-    builder.components_on_net("RESET_S32K")      # who's on a given net
-    builder.path_between("R1", "C4")             # connective path via nets
+Dependencies:
+  PyMuPDF (fitz), NetworkX
 """
 
 from __future__ import annotations
 
+import argparse
+import csv
 import json
-import re
 import math
-from dataclasses import dataclass, field
-from typing import Optional
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import pdfplumber
+import fitz  # PyMuPDF
 import networkx as nx
 
 
-# --------------------------------------------------------------------------
-# Tunable constants
-# --------------------------------------------------------------------------
+# ----------------------------- configuration -----------------------------
 
-# Endpoint-to-endpoint / endpoint-to-interior "touching" tolerance (pt).
-WIRE_JOIN_TOLERANCE = 1.2
+BLUE_COLORS = {
+    (0.0, 0.0, 1.0),
+    (0.0, 0.0, 0.502),
+    (0.0, 0.0, 0.5019999742507935),
+    (0.0, 0.0, 0.7059),
+}
+BLACK = (0.0, 0.0, 0.0)
+YELLOW_MIN = (0.80, 0.80, 0.25)
 
-# How far off a segment's *interior* an endpoint may land and still count
-# as a T-junction tap (pt). Kept tight - this is not a crossing test.
-T_JUNCTION_TOLERANCE = 1.0
+WIRE_TOUCH_TOL = 1.20
+PIN_LINE_TOL = 3.50
+LABEL_LINE_TOL = 4.50
+PIN_WIRE_MAX_DIST = 18.0
+BLACK_BRIDGE_MAX_DIST = 20.0
+BLACK_BRIDGE_TOUCH_TOL = 1.8
+LABEL_WIRE_MAX_DIST = 18.0
+POWER_LABEL_MAX_DIST = 20.0
 
-# A junction dot's centre must be within this distance of a segment's
-# line (its interior, not just near an endpoint) to force-join it at a
-# "+" crossing (pt).
-DOT_JOIN_TOLERANCE = 2.0
-
-# Filled curves this small (both dimensions) are treated as junction
-# dots rather than large filled shapes/graphics (pt).
-JUNCTION_DOT_MAX_DIAMETER = 8.0
-
-# A text label attaches to the nearest wire cluster if within this
-# distance of the cluster's nearest point (pt).
-LABEL_TO_WIRE_TOLERANCE = 12.0
-
-# Component-body-rect -> wire-cluster attach distance (pt). Larger than
-# the label tolerance since pins stick out from all sides of a chip.
-BODY_TO_WIRE_TOLERANCE = 8.0
-
-# Fallback: refdes-label-point -> wire-cluster attach distance (pt),
-# used only when no component body rectangle could be associated (this
-# is the common case for 2/3-terminal parts like R/C/D/Q, which are
-# drawn as bare glyph strokes rather than a filled body rect). Kept
-# tight: refdes labels sit right next to their symbol, and a loose
-# radius on a densely packed sheet will "see" several unrelated
-# neighbouring nets that just happen to pass nearby on paper without
-# actually touching this component's leads.
-LABEL_TO_COMPONENT_TOLERANCE = 16.0
-
-# A candidate component-body rectangle: non-hairline (both sides at
-# least this large) real geometry, e.g. an IC outline.
-MIN_BODY_RECT_SIDE = 4.0
-
-# A refdes label is assigned to a body rect if within this distance of
-# the rect's boundary (pt) - refdes labels usually sit just above/beside
-# the symbol body. Kept tight and paired with a one-to-one nearest-match
-# assignment (see _assign_refdes_to_bodies): a small component must not
-# be able to "steal" a large neighbouring IC's body just because it's
-# the closest *rectangle* within a loose radius - each rect goes to its
-# single nearest refdes label, and vice versa.
-REFDES_TO_BODY_TOLERANCE = 22.0
-
-# Ignore vector lines / rect "hairlines" longer than this fraction of
-# the page's larger dimension - almost certainly sheet border, title
-# block rules, or table gridlines rather than schematic wires.
-BORDER_LINE_FRACTION = 0.85
-
-# Many PDF renderers draw small round pin/pad markers as *zero-length*
-# lines with a round cap (a cheap way to paint a dot). These have no
-# real extent, carry no wire direction, and - critically - if fed into
-# the tracer as ordinary segments they can chain unrelated wires
-# together through pure geometric coincidence (a stray dot landing
-# within tolerance of some other net's wire). Segments shorter than
-# this are treated as drawing artifacts, not wires, and dropped before
-# tracing. Genuine wire stubs in schematics are essentially never this
-# short (pin spacing is normally >= a couple of points at minimum).
-MIN_WIRE_SEGMENT_LENGTH = 1.5
-
-# Schematic *wires* are drawn strictly horizontal or vertical in nearly
-# every tool's default style. Component *symbol glyphs* - a resistor's
-# zigzag/hatching, a diode's arrowhead, a transistor's angled leads -
-# are drawn with diagonal strokes. If diagonal glyph strokes are fed
-# into the wire tracer, a component's own decorative body art can touch
-# both of its lead stubs and short its two pins together in the
-# extracted graph, which then chain-fuses unrelated neighbouring
-# subcircuits into one false "net". Restricting wire-tracing to
-# near-axis-aligned segments (within this angle of horizontal or
-# vertical, in degrees) excludes glyph art while keeping real wires.
-# Raise this if a schematic style routes wires diagonally.
-MAX_WIRE_ANGLE_DEVIATION_DEG = 3.0
-
-# Reference-designator prefixes recognised out of the box. Extend this
-# set for schematics that use other conventions.
-REFDES_PREFIXES = (
-    "IC", "R", "C", "L", "D", "Q", "U", "Y", "J", "SW", "TP", "TPV", "TS",
-    "FB", "K", "X", "LED", "F", "B", "T", "W", "P", "S", "M", "BAT", "OSC",
-)
-
-REFDES_RE = re.compile(
-    r"^(?:" + "|".join(sorted(REFDES_PREFIXES, key=len, reverse=True)) + r")\d+[A-Z]?$"
-)
-
-# Net / signal name heuristic: mostly-uppercase token with letters,
-# digits, underscores or a leading slash (active-low), length >= 2.
-NET_NAME_RE = re.compile(r"^/?[A-Z][A-Z0-9_]{1,40}$")
-
-# A short, purely numeric (or numeric+1 letter, e.g. BGA "N3") token in
-# small font near a wire end is very likely a *pin number*, not a net
-# name or refdes.
-PIN_NUMBER_RE = re.compile(r"^[A-Z]?\d{1,3}[A-Z]?$")
-
-PAGE_REF_RE = re.compile(r"^Page\[?([\d,\s]+)\]?$", re.IGNORECASE)
-
-# Some EDA tools (notably Altium) additionally stamp an invisible,
-# click-to-highlight netlist as overlapping text runs at identical
-# coordinates: "PI<refdes><pin>" (pin identifier), "CO<refdes>"
-# (component locator), "NL<net>" (net locator, with "_" encoded as a
-# literal "0"). This data is real but not reliably separable through
-# ordinary text extraction (the overlapping runs interleave character-
-# by-character), so rather than half-trust it, we detect and exclude it
-# from the ordinary label classifier entirely - otherwise thousands of
-# these tokens masquerade as plausible net names / pin numbers and
-# pollute the geometrically-derived graph. The pattern: prefix followed
-# immediately by a letter block then a digit block (refdes+pin shape),
-# no spaces - ordinary schematic text essentially never looks like this.
-EMBEDDED_METADATA_RE = re.compile(r"^(?:PI|CO|NL)[A-Z]{1,4}\d[A-Z0-9]*$")
-
-NET_NAME_STOPWORDS = {
-    "REV", "DNP", "TITLE", "NOTES", "TOC", "BOM", "ASSY", "OPT", "REF",
-    "DES", "PAGE", "SHEET", "SIZE", "DATE", "DRAWN", "APPROVED", "GND",
+# Common EDA power names. These are only used when a visible power label is
+# actually close to a wire endpoint; they are never assigned globally by guess.
+POWER_NAMES = {
+    "GND", "VDD", "VSSA", "VDDA", "VREF+", "3V", "5V", "2V5",
+    "U5V", "VBUS", "COM", "VBAT", "VCC", "VSS", "VDD1", "VDD2",
+    "VDD3", "VDD4", "VDD5", "VDD12", "VSS1", "VSS2", "VSS3",
+    "VSS4", "VSS5",
 }
 
+# Component references that can be split into units in CO tokens.
+UNIT_SUFFIX_RE = re.compile(r"^([A-Za-z]+\d+)[A-Za-z]$")
 
-# --------------------------------------------------------------------------
-# Data model
-# --------------------------------------------------------------------------
 
-@dataclass
-class TextLabel:
-    text: str
+@dataclass(frozen=True)
+class Segment:
     page: int
-    x0: float
+    idx: int
     x1: float
-    top: float
-    bottom: float
-    font_size: float = 0.0
+    y1: float
+    x2: float
+    y2: float
+    color: Tuple[float, float, float]
 
     @property
-    def cx(self) -> float:
-        return (self.x0 + self.x1) / 2
-
-    @property
-    def cy(self) -> float:
-        return (self.top + self.bottom) / 2
+    def length(self) -> float:
+        return math.hypot(self.x2 - self.x1, self.y2 - self.y1)
 
 
 @dataclass
-class WireCluster:
-    """A set of touching/joined line segments = one electrical wire."""
-    page: int
-    cluster_id: int
-    points: list = field(default_factory=list)   # all segment endpoints
-    net_names: set = field(default_factory=set)   # net-name labels attached
-    pin_labels: list = field(default_factory=list)  # (x, y, text) small labels attached
-
-    def min_dist_to_point(self, x: float, y: float) -> float:
-        return min(math.hypot(px - x, py - y) for px, py in self.points)
-
-    def nearest_pin_label(self, x: float, y: float, max_dist: float):
-        best, best_d = None, max_dist
-        for px, py, text in self.pin_labels:
-            d = math.hypot(px - x, py - y)
-            if d < best_d:
-                best, best_d = text, d
-        return best
-
-
-@dataclass
-class BodyRect:
-    page: int
-    x0: float
-    x1: float
-    top: float
-    bottom: float
-
-    @property
-    def cx(self) -> float:
-        return (self.x0 + self.x1) / 2
-
-    @property
-    def cy(self) -> float:
-        return (self.top + self.bottom) / 2
-
-    def dist_to_point(self, x: float, y: float) -> float:
-        dx = max(self.x0 - x, 0, x - self.x1)
-        dy = max(self.top - y, 0, y - self.bottom)
-        return math.hypot(dx, dy)
-
-
-@dataclass
-class Component:
-    refdes: str
+class Pin:
+    ref: str
+    pin: str
     page: int
     x: float
     y: float
-    body: Optional[BodyRect] = None
+    source_token: str
+    wire_cluster: Optional[int] = None
+    attachment_distance: Optional[float] = None
+    attachment_method: str = "unresolved"
 
 
-# --------------------------------------------------------------------------
-# Geometry helpers
-# --------------------------------------------------------------------------
+@dataclass
+class NetAlias:
+    page: int
+    name: str
+    x: float
+    y: float
+    source: str
+    token: str = ""
+    confidence: float = 1.0
+
+
+@dataclass
+class ClusterInfo:
+    page: int
+    cluster_id: int
+    segments: List[int] = field(default_factory=list)
+    aliases: List[str] = field(default_factory=list)
+    alias_sources: List[str] = field(default_factory=list)
+
+
+# ----------------------------- geometry helpers -----------------------------
+
+
+def point_segment_distance(px: float, py: float, s: Segment) -> Tuple[float, float]:
+    vx = s.x2 - s.x1
+    vy = s.y2 - s.y1
+    vv = vx * vx + vy * vy
+    if vv == 0:
+        return math.hypot(px - s.x1, py - s.y1), 0.0
+    t = ((px - s.x1) * vx + (py - s.y1) * vy) / vv
+    tc = max(0.0, min(1.0, t))
+    qx = s.x1 + tc * vx
+    qy = s.y1 + tc * vy
+    return math.hypot(px - qx, py - qy), tc
+
+
+def infinite_line_distance(px: float, py: float, s: Segment) -> float:
+    vx = s.x2 - s.x1
+    vy = s.y2 - s.y1
+    ll = math.hypot(vx, vy)
+    if ll == 0:
+        return math.hypot(px - s.x1, py - s.y1)
+    return abs((px - s.x1) * vy - (py - s.y1) * vx) / ll
+
+
+def bbox_close(a: Segment, b: Segment, tol: float) -> bool:
+    return not (
+        max(min(a.x1, a.x2), min(b.x1, b.x2))
+        > min(max(a.x1, a.x2), max(b.x1, b.x2)) + tol
+        or max(min(a.y1, a.y2), min(b.y1, b.y2))
+        > min(max(a.y1, a.y2), max(b.y1, b.y2)) + tol
+    )
+
+
+def endpoint_to_segment_distance(x: float, y: float, s: Segment) -> float:
+    return point_segment_distance(x, y, s)[0]
+
 
 class UnionFind:
     def __init__(self, n: int):
         self.parent = list(range(n))
+        self.rank = [0] * n
 
-    def find(self, a: int) -> int:
-        while self.parent[a] != a:
-            self.parent[a] = self.parent[self.parent[a]]
-            a = self.parent[a]
-        return a
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
 
     def union(self, a: int, b: int) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[ra] = rb
+        a = self.find(a)
+        b = self.find(b)
+        if a == b:
+            return
+        if self.rank[a] < self.rank[b]:
+            a, b = b, a
+        self.parent[b] = a
+        if self.rank[a] == self.rank[b]:
+            self.rank[a] += 1
 
 
-def _dist(p1, p2) -> float:
-    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+# ----------------------------- token helpers -----------------------------
 
 
-def _is_axis_aligned(p1, p2, max_deg: float) -> bool:
-    """True if the segment is within max_deg of horizontal or vertical."""
-    dx, dy = abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
-    if dx == 0 or dy == 0:
-        return True
-    angle = math.degrees(math.atan2(min(dx, dy), max(dx, dy)))
-    return angle <= max_deg
+def normalize_ref(ref: str) -> str:
+    # U4A/U4B are two units of the same logical component U4.
+    m = UNIT_SUFFIX_RE.match(ref)
+    if m and ref.startswith("U4"):
+        return m.group(1)
+    return ref
 
 
-def _point_segment_distance(px, py, x1, y1, x2, y2) -> float:
-    """Perpendicular distance from (px,py) to the segment (x1,y1)-(x2,y2),
-    clamped to the segment (not the infinite line)."""
-    dx, dy = x2 - x1, y2 - y1
-    length_sq = dx * dx + dy * dy
-    if length_sq == 0:
-        return math.hypot(px - x1, py - y1)
-    t = ((px - x1) * dx + (py - y1) * dy) / length_sq
-    t = max(0.0, min(1.0, t))
-    cx, cy = x1 + t * dx, y1 + t * dy
-    return math.hypot(px - cx, py - cy)
+def tokenize_metadata_word(word: str) -> List[Tuple[str, str]]:
+    """Split PDF words containing concatenated hidden EDA tokens.
+
+    Example: PIU2032NLUSB0DM -> PIU2032, NLUSB0DM
+    and PILD102PIR101 -> PILD102, PIR101.
+    """
+    matches = list(re.finditer(r"(?:PI|NL|PO|CO)(?=[A-Za-z0-9_])", word))
+    if not matches:
+        return []
+    out = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(word)
+        tok = word[start:end]
+        if len(tok) >= 3:
+            out.append((tok, tok[:2]))
+    return out
 
 
-class SpatialGrid:
-    """Simple uniform grid for fast 'what's near this point' queries."""
-
-    def __init__(self, cell_size: float):
-        self.cell = cell_size
-        self.buckets: dict[tuple[int, int], list[int]] = {}
-
-    def _cell_of(self, x: float, y: float) -> tuple[int, int]:
-        return (int(x // self.cell), int(y // self.cell))
-
-    def insert_point(self, idx: int, x: float, y: float) -> None:
-        self.buckets.setdefault(self._cell_of(x, y), []).append(idx)
-
-    def insert_segment(self, idx: int, p1, p2) -> None:
-        # Register the segment's index in every grid cell its bounding
-        # box overlaps, so point/segment queries near any part of it
-        # find it. Segments are pre-filtered to be reasonably short
-        # (border/long bus lines are dropped upstream).
-        x0, x1 = sorted((p1[0], p2[0]))
-        y0, y1 = sorted((p1[1], p2[1]))
-        cx0, cx1 = int(x0 // self.cell), int(x1 // self.cell)
-        cy0, cy1 = int(y0 // self.cell), int(y1 // self.cell)
-        for cx in range(cx0, cx1 + 1):
-            for cy in range(cy0, cy1 + 1):
-                self.buckets.setdefault((cx, cy), []).append(idx)
-
-    def nearby(self, x: float, y: float, radius_cells: int = 1):
-        cx, cy = self._cell_of(x, y)
-        seen = set()
-        out = []
-        for dx in range(-radius_cells, radius_cells + 1):
-            for dy in range(-radius_cells, radius_cells + 1):
-                for i in self.buckets.get((cx + dx, cy + dy), []):
-                    if i not in seen:
-                        seen.add(i)
-                        out.append(i)
-        return out
+def extract_co_refs(page: fitz.Page) -> List[str]:
+    refs: List[str] = []
+    for w in page.get_text("words"):
+        text = w[4]
+        for tok, kind in tokenize_metadata_word(text):
+            if kind == "CO" and len(tok) > 2:
+                refs.append(normalize_ref(tok[2:]))
+    return refs
 
 
-# --------------------------------------------------------------------------
-# Main builder
-# --------------------------------------------------------------------------
+def build_ref_set(doc: fitz.Document) -> List[str]:
+    refs = set()
+    for page in doc:
+        refs.update(extract_co_refs(page))
+    # CO can occasionally miss a component; recover obvious visible designators.
+    for page in doc:
+        for w in page.get_text("words"):
+            t = w[4]
+            if re.fullmatch(r"(?:R|C|D|L|X|U|CN|JP|SB|LD|B|T|P)\d+[A-Za-z]?", t):
+                refs.add(normalize_ref(t))
+    return sorted(refs, key=lambda x: (-len(x), x))
 
-class SchematicGraphBuilder:
-    def __init__(self, pdf_path: str):
-        self.pdf_path = pdf_path
-        self.page_sizes: dict[int, tuple[float, float]] = {}
-        self.labels: list[TextLabel] = []
-        self.wire_clusters: dict[int, list[WireCluster]] = {}
-        self.components: list[Component] = []
-        self.net_label_occurrences: dict[str, list[TextLabel]] = {}
-        self.pin_label_pool: dict[int, list[TextLabel]] = {}   # page -> small labels
-        self.body_rects: dict[int, list[BodyRect]] = {}
-        self.graph: Optional[nx.Graph] = None
 
-    # ---------------------------------------------------------- parsing --
+def parse_pi_token(token: str, refs: Sequence[str]) -> Optional[Tuple[str, str]]:
+    if not token.startswith("PI"):
+        return None
+    body = token[2:]
+    for ref in refs:
+        if body.startswith(ref):
+            pin = body[len(ref):]
+            # Some EDA exports use 0 as a separator before alphabetic pin IDs.
+            if pin.startswith("0") and len(pin) > 1:
+                pin = pin[1:]
+            if pin:
+                return normalize_ref(ref), pin
+    return None
 
-    def parse(self, verbose: bool = True) -> None:
-        with pdfplumber.open(self.pdf_path) as pdf:
-            for page_idx, page in enumerate(pdf.pages, start=1):
-                self.page_sizes[page_idx] = (page.width, page.height)
-                self._parse_page_text(page, page_idx)
-                self._parse_page_geometry(page, page_idx)
-        self._classify_labels()
-        self._assign_refdes_to_bodies()
-        if verbose:
-            n_wc = sum(len(v) for v in self.wire_clusters.values())
-            print(
-                f"Parsed {len(self.page_sizes)} page(s): "
-                f"{len(self.labels)} text labels, {n_wc} wire clusters, "
-                f"{len(self.components)} components "
-                f"({sum(1 for c in self.components if c.body)} with a detected body)."
-            )
 
-    def _parse_page_text(self, page, page_idx: int) -> None:
-        words = page.extract_words(
-            use_text_flow=False, keep_blank_chars=False, extra_attrs=["size"]
+def visible_words(page: fitz.Page) -> List[Tuple]:
+    out = []
+    for w in page.get_text("words"):
+        t = w[4]
+        if any(t.startswith(prefix) for prefix in ("PI", "CO", "NL", "PO")):
+            continue
+        out.append(w)
+    return out
+
+
+def nearest_visible_text(page: fitz.Page, x: float, y: float, max_dist: float = 8.0) -> Optional[Tuple[str, float]]:
+    best = None
+    for w in visible_words(page):
+        cx = (w[0] + w[2]) / 2
+        cy = (w[1] + w[3]) / 2
+        d = math.hypot(x - cx, y - cy)
+        if d <= max_dist and (best is None or d < best[1]):
+            best = (w[4], d)
+    return best
+
+
+def extract_pins(doc: fitz.Document, refs: Sequence[str]) -> List[Pin]:
+    pins: Dict[Tuple[int, str, str, int, int], Pin] = {}
+    for page_idx, page in enumerate(doc):
+        for w in page.get_text("words"):
+            text = w[4]
+            tokens = tokenize_metadata_word(text)
+            # When a PI token is concatenated with another hidden token, the
+            # PDF gives one bounding box for the whole string. Clean PI tokens
+            # are emitted separately in this export; skipping the concatenated
+            # PI avoids duplicate pins with incorrect coordinates.
+            if len(tokens) != 1:
+                continue
+            for tok, kind in tokens:
+                if kind != "PI":
+                    continue
+                parsed = parse_pi_token(tok, refs)
+                if not parsed:
+                    continue
+                ref, pin_no = parsed
+                x = (w[0] + w[2]) / 2
+                y = (w[1] + w[3]) / 2
+                key = (page_idx, ref, pin_no, round(x, 3), round(y, 3))
+                pins[key] = Pin(ref, pin_no, page_idx, x, y, tok)
+    return list(pins.values())
+
+
+def extract_hidden_aliases(doc: fitz.Document) -> List[NetAlias]:
+    aliases: List[NetAlias] = []
+    for page_idx, page in enumerate(doc):
+        for w in page.get_text("words"):
+            text = w[4]
+            for tok, kind in tokenize_metadata_word(text):
+                if kind not in {"NL", "PO"}:
+                    continue
+                x = (w[0] + w[2]) / 2
+                y = (w[1] + w[3]) / 2
+                nearby = nearest_visible_text(page, x, y, 8.0)
+                if nearby:
+                    name = nearby[0]
+                    conf = max(0.65, 1.0 - nearby[1] / 12.0)
+                else:
+                    # Conservative fallback decoder for common Altium hidden names.
+                    raw = tok[2:]
+                    name = decode_hidden_net_name(raw)
+                    conf = 0.55
+                aliases.append(NetAlias(page_idx, name, x, y, kind, tok, conf))
+    return aliases
+
+
+def decode_hidden_net_name(raw: str) -> str:
+    """Best-effort fallback only; visible text wins whenever available."""
+    # Altium's hidden text often encodes '_' as 0 when followed by a letter.
+    s = raw.replace("0IN", "_IN").replace("0OUT", "_OUT")
+    s = s.replace("0JTCK", "_JTCK").replace("0JTMS", "_JTMS")
+    s = s.replace("0RST", "_RST").replace("0SWO", "_SWO")
+    s = s.replace("0SWDIO", "_SWDIO")
+    s = s.replace("0STLINK", "_STLINK")
+    s = s.replace("0DM", "_DM").replace("0DP", "_DP")
+    s = s.replace("0MCO", "_MCO")
+    # Preserve ordinary port names such as PA10.
+    return s
+
+
+# ----------------------------- vector extraction -----------------------------
+
+
+def is_blue(color: Optional[Tuple[float, float, float]]) -> bool:
+    if color is None:
+        return False
+    return any(sum((color[i] - c[i]) ** 2 for i in range(3)) < 2e-5 for c in BLUE_COLORS)
+
+
+def extract_blue_segments(page: fitz.Page, page_idx: int) -> List[Segment]:
+    segs: List[Segment] = []
+    idx = 0
+    for drawing in page.get_drawings():
+        color = drawing.get("color")
+        if not is_blue(color):
+            continue
+        for item in drawing.get("items", []):
+            if item[0] != "l":
+                continue
+            a, b = item[1], item[2]
+            s = Segment(page_idx, idx, a.x, a.y, b.x, b.y, tuple(color))
+            if s.length > 0.5:
+                segs.append(s)
+                idx += 1
+    return segs
+
+
+def extract_black_segments(page: fitz.Page, page_idx: int) -> List[Segment]:
+    segs: List[Segment] = []
+    idx = 0
+    for drawing in page.get_drawings():
+        color = drawing.get("color")
+        if color != BLACK:
+            continue
+        for item in drawing.get("items", []):
+            if item[0] != "l":
+                continue
+            a, b = item[1], item[2]
+            s = Segment(page_idx, idx, a.x, a.y, b.x, b.y, BLACK)
+            if s.length > 0.5:
+                segs.append(s)
+                idx += 1
+    return segs
+
+
+def _direction(s: Segment) -> Tuple[float, float]:
+    dx = s.x2 - s.x1
+    dy = s.y2 - s.y1
+    ll = math.hypot(dx, dy)
+    if ll == 0:
+        return 0.0, 0.0
+    return dx / ll, dy / ll
+
+
+def _collinear_opposite(a: Segment, b: Segment, px: float, py: float, tol: float = 0.995) -> bool:
+    """True when a and b form a straight continuation through (px, py)."""
+    da = _direction(a)
+    db = _direction(b)
+    parallel = abs(da[0] * db[1] - da[1] * db[0]) < 0.08
+    if not parallel:
+        return False
+    # Compare vectors from the junction toward the far endpoints.
+    far_a = (a.x2, a.y2) if math.hypot(a.x2 - px, a.y2 - py) > math.hypot(a.x1 - px, a.y1 - py) else (a.x1, a.y1)
+    far_b = (b.x2, b.y2) if math.hypot(b.x2 - px, b.y2 - py) > math.hypot(b.x1 - px, b.y1 - py) else (b.x1, b.y1)
+    va = (far_a[0] - px, far_a[1] - py)
+    vb = (far_b[0] - px, far_b[1] - py)
+    la = math.hypot(*va)
+    lb = math.hypot(*vb)
+    if la == 0 or lb == 0:
+        return False
+    dot = (va[0] * vb[0] + va[1] * vb[1]) / (la * lb)
+    return dot < -tol
+
+
+def build_wire_clusters(segments: Sequence[Segment], tol: float = WIRE_TOUCH_TOL) -> Tuple[UnionFind, Dict[int, List[int]]]:
+    """Build conservative wire topology.
+
+    Endpoint-to-interior joins are treated as T-junctions only when the
+    through-segment does not have a collinear continuation. This prevents a
+    PDF that split a crossing line into two pieces from turning a plain
+    crossing into a false electrical junction.
+    """
+    n = len(segments)
+    uf = UnionFind(n)
+
+    # First: exact/near endpoint-to-endpoint joins.
+    for i in range(n):
+        a = segments[i]
+        for j in range(i + 1, n):
+            b = segments[j]
+            if not bbox_close(a, b, tol):
+                continue
+            endpoint_pairs = [
+                (a.x1, a.y1, b.x1, b.y1), (a.x1, a.y1, b.x2, b.y2),
+                (a.x2, a.y2, b.x1, b.y1), (a.x2, a.y2, b.x2, b.y2),
+            ]
+            if min(math.hypot(x1-x2, y1-y2) for x1,y1,x2,y2 in endpoint_pairs) <= tol:
+                uf.union(i, j)
+
+    # Build a spatial endpoint index for continuation checks.
+    cell = max(4.0, tol * 4.0)
+    endpoint_buckets: Dict[Tuple[int, int], List[Tuple[int, float, float]]] = defaultdict(list)
+    for i, s in enumerate(segments):
+        for x, y in ((s.x1, s.y1), (s.x2, s.y2)):
+            endpoint_buckets[(round(x/cell), round(y/cell))].append((i, x, y))
+
+    def nearby_endpoints(px: float, py: float) -> Iterable[Tuple[int, float, float]]:
+        gx, gy = round(px/cell), round(py/cell)
+        for ix in range(gx-1, gx+2):
+            for iy in range(gy-1, gy+2):
+                for item in endpoint_buckets.get((ix, iy), []):
+                    if math.hypot(item[1]-px, item[2]-py) <= tol:
+                        yield item
+
+    # Then: endpoint-to-interior T-junctions.
+    for i, a in enumerate(segments):
+        for px, py in ((a.x1, a.y1), (a.x2, a.y2)):
+            for j, b in enumerate(segments):
+                if i == j or not bbox_close(a, b, tol):
+                    continue
+                pd, t = point_segment_distance(px, py, b)
+                if pd > tol or t <= tol / max(b.length, 1.0) or t >= 1.0 - tol / max(b.length, 1.0):
+                    continue
+
+                # If another segment continues b straight through this point,
+                # this is a crossing unless the PDF contains an explicit dot.
+                has_continuation = False
+                for k, ex, ey in nearby_endpoints(px, py):
+                    if k in (i, j):
+                        continue
+                    c = segments[k]
+                    if _collinear_opposite(b, c, px, py):
+                        has_continuation = True
+                        break
+                if not has_continuation:
+                    uf.union(i, j)
+
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for i in range(n):
+        groups[uf.find(i)].append(i)
+    return uf, groups
+
+
+def nearest_blue_cluster(
+    x: float,
+    y: float,
+    segments: Sequence[Segment],
+    uf: UnionFind,
+    max_perp: float = PIN_LINE_TOL,
+    max_dist: float = PIN_WIRE_MAX_DIST,
+) -> Optional[Tuple[int, float, float]]:
+    candidates = []
+    for i, s in enumerate(segments):
+        ld = infinite_line_distance(x, y, s)
+        pd, t = point_segment_distance(x, y, s)
+        if ld <= max_perp and pd <= max_dist:
+            candidates.append((pd, i, t))
+    if not candidates:
+        return None
+    pd, i, t = min(candidates, key=lambda z: z[0])
+    return uf.find(i), pd, t
+
+
+def attach_via_black_pin_stub(
+    x: float,
+    y: float,
+    blue: Sequence[Segment],
+    blue_uf: UnionFind,
+    black: Sequence[Segment],
+) -> Optional[Tuple[int, float]]:
+    candidates = []
+    for s in black:
+        ld = infinite_line_distance(x, y, s)
+        pd, _ = point_segment_distance(x, y, s)
+        if ld <= PIN_LINE_TOL and pd <= BLACK_BRIDGE_MAX_DIST:
+            candidates.append((pd, s))
+    if not candidates:
+        return None
+    pd, black_seg = min(candidates, key=lambda z: z[0])
+    best = None
+    for ex, ey in ((black_seg.x1, black_seg.y1), (black_seg.x2, black_seg.y2)):
+        for i, bs in enumerate(blue):
+            d, _ = point_segment_distance(ex, ey, bs)
+            if d <= BLACK_BRIDGE_TOUCH_TOL:
+                if best is None or d < best[0]:
+                    best = (d, i)
+    if best is None:
+        return None
+    return blue_uf.find(best[1]), pd
+
+
+def yellow_shape_anchor(page: fitz.Page, x: float, y: float) -> Optional[Tuple[float, float]]:
+    """Return the likely wire-tip of the nearest yellow EDA label shape."""
+    candidates = []
+    for d in page.get_drawings():
+        fill = d.get("fill")
+        r = d.get("rect")
+        if not fill or r is None:
+            continue
+        if not (fill[0] >= YELLOW_MIN[0] and fill[1] >= YELLOW_MIN[1] and fill[2] <= YELLOW_MIN[2]):
+            continue
+        dx = 0 if r.x0 <= x <= r.x1 else min(abs(x-r.x0), abs(x-r.x1))
+        dy = 0 if r.y0 <= y <= r.y1 else min(abs(y-r.y0), abs(y-r.y1))
+        d2 = math.hypot(dx, dy)
+        if d2 <= 8.0:
+            candidates.append((d2, r))
+    if not candidates:
+        return None
+    _, r = min(candidates, key=lambda z: z[0])
+    # The text is normally just outside the arrow body. Choose the nearest
+    # vertical edge; this is the connector/wire tip for left/right labels.
+    if x >= r.x1:
+        ax = r.x1
+    elif x <= r.x0:
+        ax = r.x0
+    else:
+        ax = r.x1 if abs(x-r.x1) < abs(x-r.x0) else r.x0
+    ay = min(max(y, r.y0), r.y1)
+    return ax, ay
+
+
+def label_to_blue_cluster(
+    alias: NetAlias,
+    page: fitz.Page,
+    segments: Sequence[Segment],
+    uf: UnionFind,
+) -> Optional[Tuple[int, float, float]]:
+    # Hidden NL/PO tokens are usually positioned over the visible net label.
+    # Use the nearest matching visible word's CENTER, which is more stable
+    # than a text baseline when several parallel nets are spaced closely.
+    best_word = None
+    best_dist = None
+    for w in visible_words(page):
+        cx0 = (w[0] + w[2]) / 2
+        cy0 = (w[1] + w[3]) / 2
+        d0 = math.hypot(alias.x - cx0, alias.y - cy0)
+        if d0 <= 8.0 and (best_dist is None or d0 < best_dist):
+            best_word, best_dist = w, d0
+    if best_word is not None:
+        cx = (best_word[0] + best_word[2]) / 2
+        cy = (best_word[1] + best_word[3]) / 2
+        c = nearest_blue_cluster(
+            cx, cy, segments, uf, max_perp=4.0, max_dist=LABEL_WIRE_MAX_DIST
         )
-        for w in words:
-            text = w["text"].strip()
-            if not text:
+        if c:
+            return c
+
+    anchor = yellow_shape_anchor(page, alias.x, alias.y)
+    x, y = anchor if anchor else (alias.x, alias.y)
+    return nearest_blue_cluster(
+        x, y, segments, uf, max_perp=LABEL_LINE_TOL, max_dist=LABEL_WIRE_MAX_DIST
+    )
+
+
+# ----------------------------- visible power labels -----------------------------
+
+
+def attach_power_labels(
+    page: fitz.Page,
+    page_idx: int,
+    blue: Sequence[Segment],
+    uf: UnionFind,
+) -> List[NetAlias]:
+    out: List[NetAlias] = []
+    for w in visible_words(page):
+        name = w[4]
+        if name not in POWER_NAMES:
+            continue
+        x = (w[0] + w[2]) / 2
+        y = (w[1] + w[3]) / 2
+        best = None
+        for s in blue:
+            pd, t = point_segment_distance(x, y, s)
+            if pd <= POWER_LABEL_MAX_DIST:
+                endpoint_distance = min(t, 1.0 - t)
+                score = pd + endpoint_distance * 8.0
+                if best is None or score < best[0]:
+                    best = (score, pd, t, s)
+        if best is None:
+            continue
+        _, pd, t, s = best
+        # Power text is usually offset from the symbol/wire endpoint. Require
+        # either a near endpoint or a very close text-to-wire distance.
+        if min(t, 1 - t) <= 0.20 or pd <= 7.0:
+            out.append(NetAlias(page_idx, name, x, y, "power-label", name, 0.90 if pd <= 7 else 0.75))
+    return out
+
+
+# ----------------------------- yellow net-label detection -----------------------------
+
+
+def extract_yellow_label_aliases(page: fitz.Page, page_idx: int) -> List[NetAlias]:
+    """Read labels inside EDA-style yellow net/port shapes.
+
+    This complements hidden NL/PO metadata and helps with local signal labels
+    such as Audio_SDA, PDM_OUT, I2S3_SCK, etc.
+    """
+    yellow_rects = []
+    for d in page.get_drawings():
+        fill = d.get("fill")
+        if not fill:
+            continue
+        if fill[0] >= YELLOW_MIN[0] and fill[1] >= YELLOW_MIN[1] and fill[2] <= YELLOW_MIN[2]:
+            yellow_rects.append(d.get("rect"))
+
+    if not yellow_rects:
+        return []
+
+    out = []
+    for w in visible_words(page):
+        x = (w[0] + w[2]) / 2
+        y = (w[1] + w[3]) / 2
+        inside = any(r.x0 - 1 <= x <= r.x1 + 1 and r.y0 - 1 <= y <= r.y1 + 1 for r in yellow_rects)
+        if not inside:
+            continue
+        name = w[4].strip()
+        if not name or name in POWER_NAMES:
+            continue
+        # Avoid component designators and obvious values.
+        if re.fullmatch(r"(?:R|C|D|L|X|U|CN|JP|SB|LD|B|T|P)\d+", name):
+            continue
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?(?:K|M|nF|pF|uF|V|MHz|kHz|mA|A)?", name, re.I):
+            continue
+        out.append(NetAlias(page_idx, name, x, y, "yellow-label", name, 0.92))
+    return out
+
+
+# ----------------------------- graph builder -----------------------------
+
+
+class SchematicGraphV3:
+    def __init__(self, pdf_path: str):
+        self.pdf_path = str(pdf_path)
+        self.doc = fitz.open(self.pdf_path)
+        self.refs = build_ref_set(self.doc)
+        self.pins = extract_pins(self.doc, self.refs)
+        self.hidden_aliases = extract_hidden_aliases(self.doc)
+        self.page_blue: Dict[int, List[Segment]] = {}
+        self.page_black: Dict[int, List[Segment]] = {}
+        self.page_uf: Dict[int, UnionFind] = {}
+        self.page_groups: Dict[int, Dict[int, List[int]]] = {}
+        self.cluster_aliases: Dict[Tuple[int, int], List[NetAlias]] = defaultdict(list)
+        self.pin_by_net: Dict[str, List[Pin]] = defaultdict(list)
+        self.unresolved: List[Pin] = []
+        self.net_aliases: Dict[str, List[str]] = defaultdict(list)
+        self.graph = nx.Graph()
+
+    def prepare_geometry(self) -> None:
+        for page_idx, page in enumerate(self.doc):
+            blue = extract_blue_segments(page, page_idx)
+            black = extract_black_segments(page, page_idx)
+            uf, groups = build_wire_clusters(blue)
+            self.page_blue[page_idx] = blue
+            self.page_black[page_idx] = black
+            self.page_uf[page_idx] = uf
+            self.page_groups[page_idx] = groups
+
+    def attach_aliases(self) -> None:
+        # Hidden NL/PO aliases.
+        for alias in self.hidden_aliases:
+            blue = self.page_blue[alias.page]
+            uf = self.page_uf[alias.page]
+            c = label_to_blue_cluster(alias, self.doc[alias.page], blue, uf)
+            if c:
+                self.cluster_aliases[(alias.page, c[0])].append(alias)
+
+        # Visible yellow labels.
+        for page_idx, page in enumerate(self.doc):
+            for alias in extract_yellow_label_aliases(page, page_idx):
+                c = label_to_blue_cluster(alias, page, self.page_blue[page_idx], self.page_uf[page_idx])
+                if c:
+                    self.cluster_aliases[(page_idx, c[0])].append(alias)
+
+        # Power labels.
+        for page_idx, page in enumerate(self.doc):
+            for alias in attach_power_labels(page, page_idx, self.page_blue[page_idx], self.page_uf[page_idx]):
+                c = label_to_blue_cluster(alias, page, self.page_blue[page_idx], self.page_uf[page_idx])
+                if c:
+                    self.cluster_aliases[(page_idx, c[0])].append(alias)
+
+    def attach_pins(self) -> None:
+        for pin in self.pins:
+            blue = self.page_blue[pin.page]
+            uf = self.page_uf[pin.page]
+            direct = nearest_blue_cluster(pin.x, pin.y, blue, uf)
+            if direct:
+                pin.wire_cluster = direct[0]
+                pin.attachment_distance = direct[1]
+                pin.attachment_method = "pin-metadata-to-vector-wire"
                 continue
-            self.labels.append(
-                TextLabel(
-                    text=text, page=page_idx,
-                    x0=w["x0"], x1=w["x1"], top=w["top"], bottom=w["bottom"],
-                    font_size=w.get("size", 0.0),
-                )
+
+            bridge = attach_via_black_pin_stub(
+                pin.x, pin.y, blue, uf, self.page_black[pin.page]
             )
-
-    def _parse_page_geometry(self, page, page_idx: int) -> None:
-        pw, ph = page.width, page.height
-        max_len = BORDER_LINE_FRACTION * max(pw, ph)
-
-        segments = []  # (p1, p2)
-        for ln in page.lines:
-            p1 = (ln["x0"], ln["top"])
-            p2 = (ln["x1"], ln["bottom"])
-            length = _dist(p1, p2)
-            if length < MIN_WIRE_SEGMENT_LENGTH or length > max_len:
+            if bridge:
+                pin.wire_cluster = bridge[0]
+                pin.attachment_distance = bridge[1]
+                pin.attachment_method = "pin-metadata-to-black-stub-to-wire"
                 continue
-            if not _is_axis_aligned(p1, p2, MAX_WIRE_ANGLE_DEVIATION_DEG):
-                continue  # component-symbol glyph art (hatching, arrows, etc.)
-            segments.append((p1, p2))
 
-        body_rects = []
-        for r in page.rects:
-            w_, h_ = r["x1"] - r["x0"], r["bottom"] - r["top"]
-            short, long_ = min(w_, h_), max(w_, h_)
-            if short <= 1.0:
-                # Hairline rect: used as a wire/pin stub by many tools.
-                # Require real extent too, for the same reason zero-length
-                # lines are dropped above.
-                if long_ < MIN_WIRE_SEGMENT_LENGTH or long_ > max_len:
-                    continue
-                segments.append(((r["x0"], r["top"]), (r["x1"], r["bottom"])))
-            elif short >= MIN_BODY_RECT_SIDE and long_ <= max_len:
-                # A "real" box: likely a component symbol body / IC outline.
-                body_rects.append(BodyRect(page_idx, r["x0"], r["x1"], r["top"], r["bottom"]))
-        self.body_rects[page_idx] = body_rects
+            pin.attachment_method = "unresolved"
+            self.unresolved.append(pin)
 
-        junction_dots = [
-            ((c["x0"] + c["x1"]) / 2, (c["top"] + c["bottom"]) / 2)
-            for c in page.curves
-            if c.get("fill")
-            and (c["x1"] - c["x0"]) <= JUNCTION_DOT_MAX_DIAMETER
-            and (c["bottom"] - c["top"]) <= JUNCTION_DOT_MAX_DIAMETER
-        ]
+    @staticmethod
+    def canonical_net_name(names: Sequence[str]) -> Optional[str]:
+        cleaned = []
+        for n in names:
+            n = n.strip()
+            if n and n not in cleaned:
+                cleaned.append(n)
+        if not cleaned:
+            return None
+        # Prefer the shortest non-generic alias when several textual variants
+        # describe the same physical net; preserve all aliases separately.
+        generic = {"GND", "VDD", "3V", "5V"}
+        non_generic = [n for n in cleaned if n not in generic]
+        return sorted(non_generic or cleaned, key=lambda s: (len(s), s))[0]
 
-        self.wire_clusters[page_idx] = self._trace_wires(segments, junction_dots)
+    def build_nets(self) -> Dict[Tuple[int, int], str]:
+        cluster_to_net: Dict[Tuple[int, int], str] = {}
+        named_groups: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
 
-    def _trace_wires(self, segments, junction_dots) -> list[WireCluster]:
-        n = len(segments)
-        uf = UnionFind(n)
-        if n == 0:
-            return []
+        # First assign names to physical clusters.
+        for key, aliases in self.cluster_aliases.items():
+            names = []
+            for a in aliases:
+                if a.name not in names:
+                    names.append(a.name)
+            canonical = self.canonical_net_name(names)
+            if canonical:
+                cluster_to_net[key] = f"NET::{canonical}"
+                for name in names:
+                    named_groups[name].append(key)
 
-        cell = max(WIRE_JOIN_TOLERANCE * 6, 6.0)
-        grid = SpatialGrid(cell)
-        for i, (p1, p2) in enumerate(segments):
-            grid.insert_segment(i, p1, p2)
+        # Unnamed clusters remain page-local and cannot be globally merged.
+        for page_idx, groups in self.page_groups.items():
+            for root in groups:
+                key = (page_idx, root)
+                if key not in cluster_to_net:
+                    cluster_to_net[key] = f"WIRE::P{page_idx+1}::{root}"
 
-        # --- Rule 1 + Rule 2: endpoint-endpoint and endpoint-interior joins.
-        for i, (p1, p2) in enumerate(segments):
-            for pt in (p1, p2):
-                for j in grid.nearby(pt[0], pt[1]):
-                    if j == i:
-                        continue
-                    q1, q2 = segments[j]
-                    # Endpoint-to-endpoint (corner).
-                    if _dist(pt, q1) <= WIRE_JOIN_TOLERANCE or _dist(pt, q2) <= WIRE_JOIN_TOLERANCE:
-                        uf.union(i, j)
-                        continue
-                    # Endpoint-to-interior (T-junction tap).
-                    d = _point_segment_distance(pt[0], pt[1], q1[0], q1[1], q2[0], q2[1])
-                    if d <= T_JUNCTION_TOLERANCE:
-                        uf.union(i, j)
+        # Merge all same-name aliases across pages by using the canonical name.
+        # Alias variants are recorded for auditability.
+        for name, keys in named_groups.items():
+            canonical = f"NET::{name}"
+            for key in keys:
+                cluster_to_net[key] = canonical
+                if name not in self.net_aliases[canonical]:
+                    self.net_aliases[canonical].append(name)
 
-        # --- Rule 3: junction-dot-forced joins at true "+" crossings.
-        for dx, dy in junction_dots:
-            touching = []
-            for j in grid.nearby(dx, dy):
-                q1, q2 = segments[j]
-                d = _point_segment_distance(dx, dy, q1[0], q1[1], q2[0], q2[1])
-                if d <= DOT_JOIN_TOLERANCE:
-                    touching.append(j)
-            for b in touching[1:]:
-                uf.union(touching[0], b)
-
-        clusters_by_root: dict[int, WireCluster] = {}
-        for i, (p1, p2) in enumerate(segments):
-            root = uf.find(i)
-            wc = clusters_by_root.get(root)
-            if wc is None:
-                wc = WireCluster(page=0, cluster_id=root)
-                clusters_by_root[root] = wc
-            wc.points.append(p1)
-            wc.points.append(p2)
-
-        clusters = list(clusters_by_root.values())
-        for idx, wc in enumerate(clusters):
-            wc.cluster_id = idx
-        return clusters
-
-    # ------------------------------------------------------ classification --
-
-    def _classify_labels(self) -> None:
-        font_sizes = [l.font_size for l in self.labels if l.font_size > 0]
-        median_size = sorted(font_sizes)[len(font_sizes) // 2] if font_sizes else 8.0
-
-        for lbl in self.labels:
-            text = lbl.text
-            if EMBEDDED_METADATA_RE.match(text):
-                continue  # tool-internal hidden annotation, not schematic text
-            if REFDES_RE.match(text):
-                self.components.append(Component(refdes=text, page=lbl.page, x=lbl.cx, y=lbl.cy))
+        # Attach pins to their net nodes.
+        for pin in self.pins:
+            if pin.wire_cluster is None:
                 continue
-            if text.upper() in NET_NAME_STOPWORDS:
-                continue
-            if PIN_NUMBER_RE.match(text) and lbl.font_size and lbl.font_size <= median_size * 0.85:
-                # Small numeric label -> very likely a pin number sitting
-                # right where a wire meets a symbol; keep it separately
-                # so we can annotate component-net edges with it.
-                self.pin_label_pool.setdefault(lbl.page, []).append(lbl)
-                continue
-            if NET_NAME_RE.match(text) and not text.isdigit():
-                self.net_label_occurrences.setdefault(text, []).append(lbl)
+            key = (pin.page, pin.wire_cluster)
+            net = cluster_to_net.get(key)
+            if net:
+                self.pin_by_net[net].append(pin)
 
-    def _assign_refdes_to_bodies(self) -> None:
-        """One-to-one nearest matching between refdes labels and body
-        rects, per page. A loose "any rect within N points" match would
-        let a small component (e.g. a crystal) latch onto a large
-        neighbouring IC's body just because that IC's huge perimeter
-        happens to pass within range from some direction - which then
-        silently inherits every one of that IC's pin connections. Greedy
-        nearest-pair assignment prevents that: each rect can be claimed
-        by at most one refdes, and only if it's mutually the closest
-        candidate on both sides.
-        """
-        by_page: dict[int, list[Component]] = {}
-        for comp in self.components:
-            by_page.setdefault(comp.page, []).append(comp)
+        return cluster_to_net
 
-        for page_idx, comps in by_page.items():
-            rects = self.body_rects.get(page_idx, [])
-            if not rects:
-                continue
-            pairs = []
-            for ci, comp in enumerate(comps):
-                for ri, rect in enumerate(rects):
-                    d = rect.dist_to_point(comp.x, comp.y)
-                    if d <= REFDES_TO_BODY_TOLERANCE:
-                        pairs.append((d, ci, ri))
-            pairs.sort(key=lambda t: t[0])
-            used_comp, used_rect = set(), set()
-            for d, ci, ri in pairs:
-                if ci in used_comp or ri in used_rect:
-                    continue
-                comps[ci].body = rects[ri]
-                used_comp.add(ci)
-                used_rect.add(ri)
+    def build_graph(self) -> nx.Graph:
+        self.prepare_geometry()
+        self.attach_aliases()
+        self.attach_pins()
+        cluster_to_net = self.build_nets()
 
-    # -------------------------------------------------------- graph build --
-
-    def build_graph(self, verbose: bool = True) -> nx.Graph:
         g = nx.Graph()
-        net_node = lambda name: f"NET:{name}"
+        # Component nodes.
+        component_refs = sorted({p.ref for p in self.pins})
+        for ref in component_refs:
+            g.add_node(ref, node_type="component")
 
-        # 1) Snap net-name labels onto their nearest wire cluster.
-        for net_name, occurrences in self.net_label_occurrences.items():
-            for lbl in occurrences:
-                clusters = self.wire_clusters.get(lbl.page, [])
-                best, best_d = None, LABEL_TO_WIRE_TOLERANCE
-                for wc in clusters:
-                    d = wc.min_dist_to_point(lbl.cx, lbl.cy)
-                    if d < best_d:
-                        best, best_d = wc, d
-                if best is not None:
-                    best.net_names.add(net_name)
+        # Net nodes and component-net edges.
+        for net, pins in self.pin_by_net.items():
+            if not pins:
+                continue
+            g.add_node(net, node_type="net", name=net.replace("NET::", "").replace("WIRE::", ""))
+            for pin in pins:
+                g.add_edge(
+                    pin.ref,
+                    net,
+                    pin=str(pin.pin),
+                    page=pin.page + 1,
+                    attachment_distance=round(pin.attachment_distance or 0.0, 3),
+                    attachment_method=pin.attachment_method,
+                )
 
-        # 2) Register pin-number labels onto their nearest wire cluster
-        #    too, so we can report "which pin" a component-net edge uses.
-        for page_idx, pins in self.pin_label_pool.items():
-            clusters = self.wire_clusters.get(page_idx, [])
-            for lbl in pins:
-                best, best_d = None, LABEL_TO_WIRE_TOLERANCE
-                for wc in clusters:
-                    d = wc.min_dist_to_point(lbl.cx, lbl.cy)
-                    if d < best_d:
-                        best, best_d = wc, d
-                if best is not None:
-                    best.pin_labels.append((lbl.cx, lbl.cy, lbl.text))
-
-        # 3) Create net nodes: named nets are merged by name across the
-        #    whole document (this is what stitches multi-sheet nets
-        #    together); unnamed wire clusters get their own anonymous node
-        #    so direct, unlabeled component-to-component wiring isn't lost.
-        for net_name in self.net_label_occurrences:
-            pages = sorted({o.page for o in self.net_label_occurrences[net_name]})
-            g.add_node(net_node(net_name), kind="net", label=net_name, pages=pages)
-
-        cluster_to_netnode: dict[tuple[int, int], list[str]] = {}
-        anon_counter = 0
-        for page_idx, clusters in self.wire_clusters.items():
-            for wc in clusters:
-                if wc.net_names:
-                    cluster_to_netnode[(page_idx, wc.cluster_id)] = [
-                        net_node(n) for n in wc.net_names
-                    ]
-                else:
-                    anon_counter += 1
-                    node_id = f"NET:_anon_p{page_idx}_{anon_counter}"
-                    g.add_node(node_id, kind="net", label=None, pages=[page_idx])
-                    cluster_to_netnode[(page_idx, wc.cluster_id)] = [node_id]
-
-        # 4) Component nodes.
-        for comp in self.components:
-            node_id = f"U:{comp.refdes}@p{comp.page}"
-            if node_id not in g:
-                g.add_node(node_id, kind="component", refdes=comp.refdes,
-                           page=comp.page, x=comp.x, y=comp.y,
-                           has_body=comp.body is not None)
-
-        # 5) Link components to nets: prefer distance to the detected
-        #    component BODY (correct for multi-pin ICs whose pins are
-        #    far from the refdes text label); fall back to the refdes
-        #    label point for symbols with no detected body (R/C/D/... are
-        #    usually drawn as bare lines, not a filled rect).
-        for comp in self.components:
-            node_id = f"U:{comp.refdes}@p{comp.page}"
-            clusters = self.wire_clusters.get(comp.page, [])
-            tolerance = BODY_TO_WIRE_TOLERANCE if comp.body else LABEL_TO_COMPONENT_TOLERANCE
-            for wc in clusters:
-                if not wc.points:
-                    continue
-                if comp.body:
-                    d = min(comp.body.dist_to_point(px, py) for px, py in wc.points)
-                    d = min(d, wc.min_dist_to_point(comp.body.cx, comp.body.cy))
-                else:
-                    d = wc.min_dist_to_point(comp.x, comp.y)
-                if d <= tolerance:
-                    anchor_x = comp.body.cx if comp.body else comp.x
-                    anchor_y = comp.body.cy if comp.body else comp.y
-                    pin = wc.nearest_pin_label(anchor_x, anchor_y, max_dist=25.0)
-                    for net_id in cluster_to_netnode.get((comp.page, wc.cluster_id), []):
-                        if g.has_edge(node_id, net_id):
-                            continue
-                        g.add_edge(node_id, net_id, pin=pin)
+        # Direct component graph as a separate edge set in attributes. We do
+        # not replace the bipartite graph because the net node is the auditable
+        # evidence for each connection.
+        for net, pins in self.pin_by_net.items():
+            by_ref = defaultdict(list)
+            for p in pins:
+                by_ref[p.ref].append(p)
+            refs = sorted(by_ref)
+            for i in range(len(refs)):
+                for j in range(i + 1, len(refs)):
+                    a, b = refs[i], refs[j]
+                    pin_a = ",".join(sorted(str(p.pin) for p in by_ref[a]))
+                    pin_b = ",".join(sorted(str(p.pin) for p in by_ref[b]))
+                    if g.has_edge(a, b) and g.edges[a, b].get("edge_type") == "component_connection":
+                        old = g.edges[a, b]
+                        old["nets"] = old.get("nets", "") + ";" + net
+                    else:
+                        # Do not add a second edge to the same Graph edge if the
+                        # bipartite net node already occupies it; use a separate
+                        # GraphML attribute later via component_edges.csv.
+                        pass
 
         self.graph = g
-        if verbose:
-            n_comp = sum(1 for _, d in g.nodes(data=True) if d.get("kind") == "component")
-            n_net = sum(1 for _, d in g.nodes(data=True) if d.get("kind") == "net")
-            print(f"Graph built: {n_comp} component nodes, {n_net} net nodes, "
-                  f"{g.number_of_edges()} edges.")
+        self.cluster_to_net = cluster_to_net
         return g
 
-    # ---------------------------------------------------------- exports --
+    def component_edges(self) -> List[Dict[str, str]]:
+        rows = []
+        for net, pins in sorted(self.pin_by_net.items()):
+            by_ref = defaultdict(list)
+            for p in pins:
+                by_ref[p.ref].append(p)
+            refs = sorted(by_ref)
+            for i, a in enumerate(refs):
+                for b in refs[i + 1:]:
+                    rows.append({
+                        "source": a,
+                        "target": b,
+                        "net": net.replace("NET::", "").replace("WIRE::", ""),
+                        "source_pins": ",".join(sorted(str(p.pin) for p in by_ref[a])),
+                        "target_pins": ",".join(sorted(str(p.pin) for p in by_ref[b])),
+                    })
+        return rows
+
+    def summary(self) -> Dict[str, int]:
+        connected_pins = sum(len(v) for v in self.pin_by_net.values())
+        named_nets = sum(1 for n in self.pin_by_net if n.startswith("NET::"))
+        return {
+            "pages": len(self.doc),
+            "components": len({p.ref for p in self.pins}),
+            "pin_records": len(self.pins),
+            "connected_pins": connected_pins,
+            "unresolved_pins": len(self.unresolved),
+            "nets_with_pins": len(self.pin_by_net),
+            "named_nets_with_pins": named_nets,
+            "component_edges": len(self.component_edges()),
+        }
+
+    # ------------------------- exports -------------------------
 
     def export_graphml(self, path: str) -> None:
-        assert self.graph is not None, "call build_graph() first"
-        g = self.graph.copy()
-        for _, data in g.nodes(data=True):
-            for k, v in list(data.items()):
-                if isinstance(v, (list, set)):
-                    data[k] = ",".join(str(x) for x in v)
-                elif v is None:
-                    data[k] = ""
-        for _, _, data in g.edges(data=True):
-            if data.get("pin") is None:
-                data["pin"] = ""
-        nx.write_graphml(g, path)
+        nx.write_graphml(self.graph, path)
 
     def export_json(self, path: str) -> None:
-        assert self.graph is not None, "call build_graph() first"
-        data = nx.node_link_data(self.graph, edges="edges")
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, default=str)
+        data = {
+            "source_pdf": self.pdf_path,
+            "summary": self.summary(),
+            "nodes": [dict(id=n, **d) for n, d in self.graph.nodes(data=True)],
+            "edges": [dict(source=u, target=v, **d) for u, v, d in self.graph.edges(data=True)],
+            "component_edges": self.component_edges(),
+            "unresolved_pins": [asdict(p) for p in self.unresolved],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
-    def export_component_net_table(self, path: str) -> None:
-        """Flat CSV: refdes, page, pin, net_id, net_label - one row per pin."""
-        assert self.graph is not None, "call build_graph() first"
-        import csv
-        with open(path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["refdes", "page", "pin", "net_id", "net_label"])
-            for node_id, data in self.graph.nodes(data=True):
-                if data.get("kind") != "component":
-                    continue
-                for neighbor in self.graph.neighbors(node_id):
-                    ndata = self.graph.nodes[neighbor]
-                    edata = self.graph.edges[node_id, neighbor]
-                    writer.writerow([
-                        data["refdes"], data["page"], edata.get("pin") or "",
-                        neighbor, ndata.get("label") or "(unnamed wire)",
-                    ])
+    def export_component_nets(self, path: str) -> None:
+        rows = []
+        for net, pins in sorted(self.pin_by_net.items()):
+            name = net.replace("NET::", "").replace("WIRE::", "")
+            for p in sorted(pins, key=lambda x: (x.ref, str(x.pin))):
+                rows.append({
+                    "component": p.ref,
+                    "pin": p.pin,
+                    "net": name,
+                    "page": p.page + 1,
+                    "attachment_distance": round(p.attachment_distance or 0.0, 3),
+                    "attachment_method": p.attachment_method,
+                })
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "component", "pin", "net", "page", "attachment_distance", "attachment_method"
+            ])
+            writer.writeheader()
+            writer.writerows(rows)
 
-    def export_visualization(self, path: str, max_nodes: int = 400) -> None:
-        import matplotlib
-        matplotlib.use("Agg")
+    def export_component_edges(self, path: str) -> None:
+        rows = self.component_edges()
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "source", "target", "net", "source_pins", "target_pins"
+            ])
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def export_unresolved(self, path: str) -> None:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "component", "pin", "page", "x", "y", "source_token", "reason"
+            ])
+            writer.writeheader()
+            for p in self.unresolved:
+                writer.writerow({
+                    "component": p.ref,
+                    "pin": p.pin,
+                    "page": p.page + 1,
+                    "x": round(p.x, 3),
+                    "y": round(p.y, 3),
+                    "source_token": p.source_token,
+                    "reason": "No sufficiently supported vector-wire attachment found",
+                })
+
+    def export_aliases(self, path: str) -> None:
+        rows = []
+        for key, aliases in sorted(self.cluster_aliases.items()):
+            for a in aliases:
+                rows.append({
+                    "page": a.page + 1,
+                    "cluster": key[1],
+                    "name": a.name,
+                    "source": a.source,
+                    "token": a.token,
+                    "confidence": round(a.confidence, 3),
+                })
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "page", "cluster", "name", "source", "token", "confidence"
+            ])
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def export_visualization(self, path: str) -> None:
         import matplotlib.pyplot as plt
 
-        assert self.graph is not None, "call build_graph() first"
-        g = self.graph
-        if g.number_of_nodes() > max_nodes:
-            top_nodes = sorted(g.nodes, key=lambda n: -g.degree(n))[:max_nodes]
-            g = g.subgraph(top_nodes)
+        comp_edges = self.component_edges()
+        if not comp_edges:
+            # Still create a useful component-only image.
+            g = nx.Graph()
+            for ref in sorted({p.ref for p in self.pins}):
+                g.add_node(ref)
+        else:
+            g = nx.Graph()
+            for row in comp_edges:
+                g.add_edge(row["source"], row["target"], net=row["net"])
 
-        pos = nx.spring_layout(g, seed=42, k=0.6)
-        comp_nodes = [n for n, d in g.nodes(data=True) if d.get("kind") == "component"]
-        net_nodes = [n for n, d in g.nodes(data=True) if d.get("kind") == "net"]
-
-        plt.figure(figsize=(16, 16))
-        nx.draw_networkx_edges(g, pos, alpha=0.25, width=0.6)
-        nx.draw_networkx_nodes(g, pos, nodelist=comp_nodes, node_color="#3b82f6",
-                                node_size=90, label="Component")
-        nx.draw_networkx_nodes(g, pos, nodelist=net_nodes, node_color="#f59e0b",
-                                node_size=35, label="Net")
-        nx.draw_networkx_labels(
-            g, pos, labels={n: g.nodes[n]["refdes"] for n in comp_nodes}, font_size=6
-        )
-        plt.legend(scatterpoints=1)
+        plt.figure(figsize=(18, 12))
+        if len(g):
+            pos = nx.spring_layout(g, seed=42, k=None)
+            nx.draw_networkx_nodes(g, pos, node_size=350)
+            nx.draw_networkx_edges(g, pos, width=0.7, alpha=0.55)
+            nx.draw_networkx_labels(g, pos, font_size=6)
         plt.axis("off")
         plt.tight_layout()
-        plt.savefig(path, dpi=180)
+        plt.savefig(path, dpi=220, bbox_inches="tight")
         plt.close()
 
-    # ---------------------------------------------------------- queries --
 
-    def net_of(self, refdes: str):
-        assert self.graph is not None
-        out = []
-        for node_id, data in self.graph.nodes(data=True):
-            if data.get("kind") == "component" and data.get("refdes") == refdes:
-                out.extend(self.graph.neighbors(node_id))
-        return out
+# ----------------------------- CLI -----------------------------
 
-    def components_on_net(self, net_name: str):
-        assert self.graph is not None
-        node_id = f"NET:{net_name}"
-        if node_id not in self.graph:
-            return []
-        return [n for n in self.graph.neighbors(node_id)
-                if self.graph.nodes[n].get("kind") == "component"]
 
-    def path_between(self, refdes_a: str, refdes_b: str):
-        assert self.graph is not None
-        a_nodes = [n for n, d in self.graph.nodes(data=True)
-                   if d.get("kind") == "component" and d.get("refdes") == refdes_a]
-        b_nodes = [n for n, d in self.graph.nodes(data=True)
-                   if d.get("kind") == "component" and d.get("refdes") == refdes_b]
-        best = None
-        for a in a_nodes:
-            for b in b_nodes:
-                try:
-                    p = nx.shortest_path(self.graph, a, b)
-                except nx.NetworkXNoPath:
-                    continue
-                if best is None or len(p) < len(best):
-                    best = p
-        return best
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("pdf", help="Path to schematic PDF")
+    ap.add_argument("--out-prefix", default="schematic_v3", help="Output file prefix")
+    ap.add_argument("--viz", action="store_true", help="Also render component graph overview PNG")
+    args = ap.parse_args()
 
-    def summary(self) -> None:
-        assert self.graph is not None
-        g = self.graph
-        n_comp = sum(1 for _, d in g.nodes(data=True) if d.get("kind") == "component")
-        n_net_named = sum(1 for _, d in g.nodes(data=True)
-                           if d.get("kind") == "net" and d.get("label"))
-        n_net_anon = sum(1 for _, d in g.nodes(data=True)
-                          if d.get("kind") == "net" and not d.get("label"))
-        n_with_pin = sum(1 for _, _, d in g.edges(data=True) if d.get("pin"))
-        comps_by_conn_count = sorted(
-            ((d["refdes"], g.degree(n)) for n, d in g.nodes(data=True)
-             if d.get("kind") == "component"),
-            key=lambda t: -t[1],
-        )
-        print("=" * 60)
-        print(f"Components:          {n_comp}")
-        print(f"Named nets:          {n_net_named}")
-        print(f"Unnamed wires:       {n_net_anon}")
-        print(f"Edges (connections): {g.number_of_edges()}")
-        print(f"  of which pin-labeled: {n_with_pin}")
-        print(f"Connected components (isolated excluded): "
-              f"{sum(1 for _, c in comps_by_conn_count if c > 0)}")
-        print("Most-connected components:")
-        for refdes, deg in comps_by_conn_count[:10]:
-            print(f"  {refdes:12s} degree={deg}")
-        print("=" * 60)
+    prefix = Path(args.out_prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    extractor = SchematicGraphV3(args.pdf)
+    extractor.build_graph()
+
+    extractor.export_graphml(str(prefix.with_suffix(".graphml")))
+    extractor.export_json(str(prefix.with_suffix(".json")))
+    extractor.export_component_nets(str(prefix.parent / f"{prefix.name}_component_nets.csv"))
+    extractor.export_component_edges(str(prefix.parent / f"{prefix.name}_component_edges.csv"))
+    extractor.export_unresolved(str(prefix.parent / f"{prefix.name}_unresolved_pins.csv"))
+    extractor.export_aliases(str(prefix.parent / f"{prefix.name}_net_aliases.csv"))
+    if args.viz:
+        extractor.export_visualization(str(prefix.parent / f"{prefix.name}_overview.png"))
+
+    print("=" * 72)
+    print("Schematic graph extraction complete")
+    print(json.dumps(extractor.summary(), indent=2))
+    print("=" * 72)
+    print(f"GraphML:              {prefix.with_suffix('.graphml')}")
+    print(f"JSON:                 {prefix.with_suffix('.json')}")
+    print(f"Component/net CSV:    {prefix.parent / (prefix.name + '_component_nets.csv')}")
+    print(f"Component edges CSV:  {prefix.parent / (prefix.name + '_component_edges.csv')}")
+    print(f"Unresolved pins CSV:   {prefix.parent / (prefix.name + '_unresolved_pins.csv')}")
+    print(f"Net aliases CSV:       {prefix.parent / (prefix.name + '_net_aliases.csv')}")
 
 
 if __name__ == "__main__":
-    import argparse
-
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("pdf", help="Path to schematic PDF")
-    ap.add_argument("--out-prefix", default="schematic", help="Output file prefix")
-    ap.add_argument("--viz", action="store_true", help="Also render a PNG overview")
-    args = ap.parse_args()
-
-    builder = SchematicGraphBuilder(args.pdf)
-    builder.parse()
-    builder.build_graph()
-    builder.summary()
-    builder.export_graphml(f"{args.out_prefix}.graphml")
-    builder.export_json(f"{args.out_prefix}.json")
-    builder.export_component_net_table(f"{args.out_prefix}_connections.csv")
-    if args.viz:
-        builder.export_visualization(f"{args.out_prefix}_overview.png")
-    print(f"Wrote {args.out_prefix}.graphml, {args.out_prefix}.json, "
-          f"{args.out_prefix}_connections.csv")
+    main()
