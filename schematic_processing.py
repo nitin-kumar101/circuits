@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-schematic_graph_v5.py
+schematic_graph_v6.py
 
-Generic, fast schematic connectivity extractor for vector PDF schematics, including dense pin-table / BGA-style pages.
+Generic, fast multi-layout schematic extractor for vector PDF schematics: dense SITE/BGA pin maps, conventional circuits, power rails and repeated passive banks.
 
 Design goals
 ------------
@@ -33,7 +33,7 @@ optional: <prefix>_overview.png
 
 Usage
 -----
-python schematic_graph_v4.py input.pdf --out-prefix result --viz
+python schematic_graph_v6.py input.pdf --out-prefix result --viz
 
 Dependencies: PyMuPDF, NetworkX
 """
@@ -481,6 +481,8 @@ class Extractor:
         self.pin_records: list[PinRecord] = []
         self.pin_tables: list[dict] = []
         self.external_links: list[dict] = []
+        self.signal_rows: list[dict] = []
+        self.page_profiles: list[dict] = []
         self.graph = nx.Graph()
         self.stats = {}
 
@@ -507,6 +509,8 @@ class Extractor:
 
         self._extract_components_and_labels()
         self._extract_pin_tables()
+        self._extract_signal_rows()
+        self._profile_pages()
         self._attach_labels()
         self._attach_components()
         self._build_graph()
@@ -781,6 +785,74 @@ class Extractor:
             "evidence": r.evidence,
         } for r in self.pin_records if r.external_id or r.net]
 
+
+    def _extract_signal_rows(self):
+        """Capture visible signal/net rows even when they are not a formal SITE table.
+
+        This is intentionally text-first: many laptop schematics encode useful
+        cross-sheet references as text next to a short wire/port glyph.  Requiring
+        a component body would lose that information.  Every accepted row must
+        still be close to traced vector geometry.
+        """
+        seen = set()
+        for pi, words in self.text.items():
+            rows = self._row_groups(words)
+            for row in rows:
+                nets = [w for w in row if self._looks_structured_net(w.text)]
+                exts = [w for w in row if self._is_external_id(w.text)]
+                coords = [w for w in row if self._is_pin_coord(w.text) and not parse_ref(w.text)]
+                if not nets:
+                    continue
+                # Prefer the strongest signal-like token in the row.
+                nets.sort(key=lambda w: (
+                    not ("_" in w.text or "#" in w.text or "/" in w.text or re.match(r"^\d+_", w.text)),
+                    -len(w.text)))
+                nw = nets[0]
+                wc, d = self._nearest_cluster_fast(pi, nw.cx, nw.cy, LABEL_WIRE_TOL + 4.0)
+                if wc is None:
+                    continue
+                ext = min(exts, key=lambda w: abs(w.cx-nw.cx)).text if exts else ""
+                coord = min(coords, key=lambda w: abs(w.cx-nw.cx)).text if coords else ""
+                key = (pi, nw.text, ext, coord, round(nw.cy,1))
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.signal_rows.append({
+                    "page": pi, "net": nw.text.strip(), "external_id": ext.strip(),
+                    "pin_number": coord.strip(), "row_y": round(nw.cy,3),
+                    "cluster": wc.cluster_id, "distance": round(d,3),
+                    "evidence": "visible-row+vector-wire"
+                })
+
+    def _profile_pages(self):
+        """Classify each page cheaply so downstream code can choose suitable logic."""
+        pins_by_page = Counter(r.page for r in self.pin_records)
+        comps_by_page = Counter(c.page for c in self.components)
+        labels_by_page = Counter(n.page for n in self.net_labels)
+        for pi in sorted(self.pages):
+            p = self.pages[pi]
+            segs = self.segments[pi]
+            horiz = sum(s.horizontal for s in segs)
+            vert = sum(s.vertical for s in segs)
+            pins = pins_by_page[pi]
+            comps = comps_by_page[pi]
+            if pins >= MIN_PIN_TABLE_ROWS:
+                kind = "dense_pin_map"
+            elif comps >= 20 and vert >= 20:
+                kind = "component_dense_circuit"
+            elif vert > horiz * 0.55 and comps >= 8:
+                kind = "power_or_passive_bank"
+            else:
+                kind = "general_schematic"
+            self.page_profiles.append({
+                "page": pi, "type": kind, "width": round(p.rect.width,2),
+                "height": round(p.rect.height,2), "text_items": len(self.text[pi]),
+                "wire_segments": len(segs), "wire_clusters": len(self.clusters[pi]),
+                "components": comps, "net_labels": labels_by_page[pi],
+                "pin_records": pins, "horizontal_segments": horiz,
+                "vertical_segments": vert
+            })
+
     def _attach_labels(self):
         for label in self.net_labels:
             # Avoid title-block labels: only accept labels with nearby vector geometry.
@@ -894,6 +966,9 @@ class Extractor:
             "components_with_connections": len(set(r["component"] for r in self.component_nets)),
             "unresolved_components": len(self.unresolved),
             "component_edges": len(self.component_edges()),
+            "structured_pin_records": len(self.pin_records),
+            "signal_rows": len(self.signal_rows),
+            "page_profiles": len(self.page_profiles),
             "graph_nodes": self.graph.number_of_nodes() if self.graph else 0,
             "graph_edges": self.graph.number_of_edges() if self.graph else 0,
             "pin_records": len(self.pin_records),
@@ -914,6 +989,8 @@ class Extractor:
             "pin_records": [r.__dict__ for r in self.pin_records],
             "pin_tables": self.pin_tables,
             "external_links": self.external_links,
+            "signal_rows": self.signal_rows,
+            "page_profiles": self.page_profiles,
         }
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -972,6 +1049,14 @@ class Extractor:
             fields = ["page", "block", "pin_name", "pin_number", "net", "external_id", "side", "evidence"]
             w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(self.external_links)
 
+        with open(str(prefix) + "_signal_rows.csv", "w", newline="", encoding="utf-8") as f:
+            fields = ["page", "net", "external_id", "pin_number", "row_y", "cluster", "distance", "evidence"]
+            w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(self.signal_rows)
+
+        with open(str(prefix) + "_page_profiles.csv", "w", newline="", encoding="utf-8") as f:
+            fields = ["page", "type", "width", "height", "text_items", "wire_segments", "wire_clusters", "components", "net_labels", "pin_records", "horizontal_segments", "vertical_segments"]
+            w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(self.page_profiles)
+
         with open(str(prefix) + "_page_text.csv", "w", newline="", encoding="utf-8") as f:
             fields = ["page", "text", "x0", "y0", "x1", "y1", "size"]
             w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
@@ -1003,7 +1088,7 @@ class Extractor:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("pdf", help="input schematic PDF")
-    ap.add_argument("--out-prefix", default="schematic_v5")
+    ap.add_argument("--out-prefix", default="schematic_v6")
     ap.add_argument("--viz", action="store_true")
     args = ap.parse_args()
 
