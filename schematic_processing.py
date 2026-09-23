@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-schematic_graph_v6.py
+schematic_graph_v8_generic.py
 
 Generic, fast multi-layout schematic extractor for vector PDF schematics: dense SITE/BGA pin maps, conventional circuits, power rails and repeated passive banks.
 
@@ -33,7 +33,7 @@ optional: <prefix>_overview.png
 
 Usage
 -----
-python schematic_graph_v6.py input.pdf --out-prefix result --viz
+python schematic_graph_v8_generic.py input.pdf --out-prefix result --viz
 
 Dependencies: PyMuPDF, NetworkX
 """
@@ -84,7 +84,11 @@ REF_PREFIXES = (
     "R", "C", "L", "D", "Q", "U", "Y", "J", "K", "X", "F",
     "B", "T", "W", "P", "S", "M",
 )
-REF_RE = re.compile(r"^(?:" + "|".join(sorted(REF_PREFIXES, key=len, reverse=True)) + r")\d+[A-Z]?$", re.I)
+REF_RE = re.compile(
+    r"^(?:(?:[A-Z][A-Z0-9]*_)+)?(?:"
+    + "|".join(sorted(REF_PREFIXES, key=len, reverse=True))
+    + r")\d+(?:[A-Z]|_[A-Z0-9]+)?$", re.I
+)
 
 # Net names are intentionally broader than the previous versions. These
 # examples are all common in real schematics: +3V, VCORE, RESET#, USBP1-,
@@ -1064,6 +1068,52 @@ class Extractor:
                 for item in words:
                     w.writerow({"page": pi, **item.__dict__})
 
+    def netlist_rows(self):
+        """Build the canonical Net Name -> Net Pins table.
+
+        Priority is given to structured pin records because those contain an
+        explicit block/site + pin coordinate. Generic component/net records
+        are retained as component endpoints when an exact pin is unavailable.
+        Anonymous nets are omitted from the canonical human-facing netlist.
+        """
+        by_net = defaultdict(set)
+
+        # Exact/structured pins: SITE1 + A11 => SITE1.A11.
+        for r in self.pin_records:
+            net = (r.net or "").strip()
+            pin = (r.pin_number or "").strip()
+            block = (r.block or "").strip()
+            if not net or net.startswith("_ANON_") or not pin:
+                continue
+            endpoint = f"{block}.{pin}" if block else pin
+            by_net[net].add(endpoint)
+
+        # Generic component associations. These are useful for passives and
+        # pages where the PDF does not expose an unambiguous pin coordinate.
+        for r in self.component_nets:
+            net = str(r.get("net", "")).strip()
+            comp = str(r.get("component", "")).strip()
+            if not net or net.startswith("_ANON_") or not comp:
+                continue
+            # Avoid adding a bare block name if exact pins for that block/net
+            # are already present.
+            if not any(x.startswith(comp + ".") for x in by_net[net]):
+                by_net[net].add(comp)
+
+        rows = []
+        for net in sorted(by_net, key=lambda x: (x.upper(), x)):
+            pins = sorted(by_net[net], key=lambda x: (x.upper(), x))
+            rows.append({"Net Name": net, "Net Pins": " ".join(pins),
+                         "Pin Count": len(pins)})
+        return rows
+
+    def export_netlist_csv(self, path):
+        rows = self.netlist_rows()
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            fields = ["Net Name", "Net Pins", "Pin Count"]
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader(); w.writerows(rows)
+
     def export_summary(self, path):
         Path(path).write_text(json.dumps(self.summary(), indent=2), encoding="utf-8")
 
@@ -1099,6 +1149,7 @@ def main():
     ex.export_graphml(str(out) + ".graphml")
     ex.export_csvs(out)
     ex.export_pin_csvs(out)
+    ex.export_netlist_csv(str(out) + "_netlist.csv")
     ex.export_summary(str(out) + "_summary.json")
     if args.viz:
         ex.export_overview(str(out) + "_overview.png")
