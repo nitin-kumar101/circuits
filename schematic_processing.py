@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-schematic_graph_v8_generic.py
+schematic_graph_v9.py
 
 Generic, fast multi-layout schematic extractor for vector PDF schematics: dense SITE/BGA pin maps, conventional circuits, power rails and repeated passive banks.
 
@@ -35,7 +35,7 @@ Usage
 -----
 python schematic_graph_v8_generic.py input.pdf --out-prefix result --viz
 
-Dependencies: PyMuPDF, NetworkX
+Dependencies: PyMuPDF, NetworkX. PDF inference is provisional: inspect evidence.
 """
 from __future__ import annotations
 
@@ -384,6 +384,26 @@ def extract_junction_dots(page):
     return dots
 
 
+def extract_observations(page, page_idx):
+    """Keep PDF paths and annotations even when they cannot be called wires."""
+    drawings = []
+    for i, dr in enumerate(page.get_drawings()):
+        r = dr.get("rect")
+        drawings.append({"id": f"p{page_idx}:drawing:{i}", "page": page_idx,
+                         "bbox": list(r) if r else None, "type": dr.get("type"),
+                         "color": dr.get("color"), "fill": dr.get("fill"),
+                         "width": dr.get("width"),
+                         "items": [{"type": str(it[0]), "points":
+                                    [list(v) if isinstance(v, fitz.Point) else str(v)
+                                     for v in it[1:]]} for it in dr.get("items", [])]})
+    links = []
+    for i, link in enumerate(page.get_links()):
+        links.append({"id": f"p{page_idx}:link:{i}", "page": page_idx,
+                      "kind": link.get("kind"), "from": list(link["from"]) if link.get("from") else None,
+                      "page_target": link.get("page"), "uri": link.get("uri")})
+    return drawings, links
+
+
 def build_clusters(segments: list[Segment], dots):
     """Topology reconstruction using a spatial grid; never performs all-pairs testing."""
     n = len(segments)
@@ -466,8 +486,9 @@ def rect_boundary_distance(x, y, r):
 
 
 class Extractor:
-    def __init__(self, pdf_path):
+    def __init__(self, pdf_path, allow_proximity=False):
         self.pdf_path = str(pdf_path)
+        self.allow_proximity = allow_proximity
         self.doc = fitz.open(self.pdf_path)
         self.pages = {}
         self.text = {}
@@ -489,11 +510,20 @@ class Extractor:
         self.page_profiles: list[dict] = []
         self.graph = nx.Graph()
         self.stats = {}
+        self.raw_drawings = {}
+        self.pdf_links = {}
+        self.relationships = []
+        self.channels = []
+        self.sites = []
+        self.ambiguities = []
+        self.net_islands = []
+        self.label_assignments = []
 
     def parse(self, verbose=True):
         # Pass 1: page extraction. No expensive nested geometry loops here.
         for pi, page in enumerate(self.doc, start=1):
             self.pages[pi] = page
+            self.raw_drawings[pi], self.pdf_links[pi] = extract_observations(page, pi)
             words = extract_text(page, pi)
             self.text[pi] = words
             self.segments[pi] = extract_segments(page, pi)
@@ -517,6 +547,8 @@ class Extractor:
         self._profile_pages()
         self._attach_labels()
         self._attach_components()
+        self._resolve_islands()
+        self._derive_semantics()
         self._build_graph()
         self.stats = self.summary()
         return self
@@ -859,11 +891,31 @@ class Extractor:
 
     def _attach_labels(self):
         for label in self.net_labels:
-            # Avoid title-block labels: only accept labels with nearby vector geometry.
-            wc, d = self._nearest_cluster_fast(label.page, label.x, label.y, LABEL_WIRE_TOL)
-            if wc is None:
+            # A text label by itself has no PDF electrical type or anchor.
+            # Compare the two nearest islands and retain ambiguous matches.
+            candidates = []
+            for wc in self.clusters[label.page]:
+                d = wc.distance_to_point(label.x, label.y, self.segments[label.page])
+                if d <= LABEL_WIRE_TOL:
+                    candidates.append((d, wc.cluster_id))
+            candidates.sort()
+            if not candidates:
                 continue
-            self.cluster_labels[(label.page, wc.cluster_id)].add(label.name)
+            d, cid = candidates[0]
+            ambiguous = len(candidates) > 1 and candidates[1][0] - d < 2.0
+            # Mere proximity to ordinary prose is insufficient.
+            strong = label.name.upper() in POWER_WORDS or any(ch in label.name for ch in "_#/+.-")
+            accepted = not ambiguous and strong and d <= 7.0
+            self.label_assignments.append({"page": label.page, "name": label.name,
+                "cluster": cid, "distance": round(d, 3), "accepted": accepted,
+                "confidence": 0.75 if accepted else 0.25,
+                "method": "near_wire_text", "alternatives": [j for _, j in candidates[1:3]],
+                "bbox_center": [label.x, label.y]})
+            if accepted:
+                self.cluster_labels[(label.page, cid)].add(label.name)
+            else:
+                self.ambiguities.append({"type": "unattached_label", "page": label.page,
+                                         "name": label.name, "candidate_cluster": cid})
 
     def _component_candidate_clusters(self, comp: Component):
         # Generic fallback: connect a component only to the closest traced
@@ -877,6 +929,11 @@ class Extractor:
 
     def _attach_components(self):
         for comp in self.components:
+            if not self.allow_proximity:
+                self.unresolved.append({"page": comp.page, "component": comp.ref,
+                    "x": comp.x, "y": comp.y,
+                    "reason": "reference text has no verified pin terminal; use --allow-proximity for tentative candidates"})
+                continue
             candidates = self._component_candidate_clusters(comp)
             # Do not attach to every nearby line. Keep only the closest evidence
             # and ties that are genuinely very close. This prevents a dense bus
@@ -910,52 +967,140 @@ class Extractor:
                     self.component_nets.append({
                         "component": comp.ref, "page": comp.page,
                         "net": name, "cluster": wc.cluster_id,
-                        "distance": round(d, 3), "evidence": method,
+                        "distance": round(d, 3), "evidence": method, "confidence": 0.2,
                     })
                 else:
                     self.component_nets.append({
                         "component": comp.ref, "page": comp.page,
                         "net": f"_ANON_P{comp.page}_{wc.cluster_id}",
                         "cluster": wc.cluster_id,
-                        "distance": round(d, 3), "evidence": method,
+                        "distance": round(d, 3), "evidence": method, "confidence": 0.2,
                     })
 
-    def _build_graph(self):
-        g = nx.Graph()
-        for comp in self.components:
-            g.add_node(f"C:{comp.ref}@p{comp.page}", kind="component", ref=comp.ref, page=comp.page)
+    def _relation(self, source, target, relation, confidence, method, page, evidence=None):
+        self.relationships.append({"source": source, "target": target,
+            "relation": relation, "confidence": confidence, "method": method,
+            "page": page, "evidence": evidence or []})
 
-        # Map cluster aliases to stable logical net IDs.
-        for rec in self.component_nets:
-            net = rec["net"]
-            node = f"N:{net}"
-            g.add_node(node, kind="net", name=net)
-            comp_node = f"C:{rec['component']}@p{rec['page']}"
-            g.add_edge(comp_node, node,
-                       page=rec["page"], cluster=rec["cluster"],
-                       distance=rec["distance"], evidence=rec["evidence"])
+    def _resolve_islands(self):
+        """A named island is scoped to its page unless a global label is proven."""
+        for pi, clusters in self.clusters.items():
+            for wc in clusters:
+                names = sorted(self.cluster_labels.get((pi, wc.cluster_id), set()))
+                nid = f"net:p{pi}:island:{wc.cluster_id}"
+                self.net_islands.append({"id": nid, "page": pi, "cluster": wc.cluster_id,
+                    "labels": names, "segment_ids": [f"p{pi}:segment:{i}" for i in wc.segments],
+                    "scope": "page", "status": "conflicting_labels" if len(names) > 1 else "observed_island"})
+                for name in names:
+                    self._relation(nid, f"label:p{pi}:{name}", "LABELED_AS", 0.75,
+                                   "near_wire_text", pi, [f"p{pi}:segment:{i}" for i in wc.segments[:3]])
+                if len(names) > 1:
+                    self.ambiguities.append({"type": "conflicting_island_labels", "page": pi,
+                                             "cluster": wc.cluster_id, "labels": names})
+
+    def _derive_semantics(self):
+        """Strong row associations only; channel grouping is lexical inference."""
+        channel_re = re.compile(r"(?:^|[_/.-])(?:CH(?:ANNEL)?|LANE)(\d+)(?:$|[_/.-])", re.I)
+        site_re = re.compile(r"\bSITE[_ -]?(\d+)\b", re.I)
+        channels = set()
+        sites = set()
+        for r in self.pin_records:
+            if not r.block or not r.pin_number:
+                self.ambiguities.append({"type": "unresolved_pin_owner", "page": r.page,
+                                         "pin": r.pin_number, "block": r.block})
+                continue
+            owner = f"component:{r.block}@p{r.page}"
+            pin = f"pin:{r.block}:{r.pin_number}@p{r.page}"
+            self._relation(owner, pin, "HAS_PIN", 0.9, "repeated_aligned_pin_table", r.page,
+                           [{"row_y": r.row_y, "x": r.x, "pin_name": r.pin_name}])
+            if r.net:
+                net = f"net:p{r.page}:label:{r.net}"
+                self._relation(pin, net, "CONNECTED_TO", 0.83, "aligned_pin_net_row", r.page,
+                               [{"row_y": r.row_y, "pin_name": r.pin_name, "external_id": r.external_id}])
+            else:
+                net = None
+            m = site_re.search(r.block)
+            if m:
+                site = f"site:{m.group(1)}@p{r.page}"
+                sites.add((site, r.page))
+                self._relation(site, owner, "CONTAINS", 0.8, "site_heading", r.page)
+            for token in (r.pin_name, r.net):
+                m = channel_re.search(token or "")
+                if m:
+                    channel = f"channel:{m.group(1)}@p{r.page}"
+                    channels.add((channel, r.page))
+                    self._relation(channel, pin, "HAS_PIN", 0.55,
+                                   "signal_name_channel_pattern", r.page, [{"text": token}])
+                    if net:
+                        self._relation(channel, net, "HAS_SIGNAL_NET", 0.55,
+                                       "signal_name_channel_pattern", r.page, [{"text": token}])
+        self.channels = [{"id": c, "page": p} for c, p in sorted(channels)]
+        self.sites = [{"id": s, "page": p} for s, p in sorted(sites)]
+        for r in self.component_nets:
+            self._relation(f"component:{r['component']}@p{r['page']}",
+                           f"net:p{r['page']}:island:{r['cluster']}", "POSSIBLY_CONNECTED_TO",
+                           0.2, "reference_text_proximity", r["page"], [{"distance": r["distance"]}])
+
+    def _build_graph(self):
+        g = nx.MultiDiGraph()
+        for c in self.components:
+            g.add_node(f"component:{c.ref}@p{c.page}", kind="component", name=c.ref, page=c.page)
+        for n in self.net_islands:
+            g.add_node(n["id"], kind="net_island", name=",".join(n["labels"]), page=n["page"])
+        for rel in self.relationships:
+            for node in (rel["source"], rel["target"]):
+                if node not in g:
+                    g.add_node(node, kind=node.split(":", 1)[0], name=node.split(":", 1)[-1], page=rel["page"])
+            g.add_edge(rel["source"], rel["target"], relation=rel["relation"],
+                       confidence=rel["confidence"], method=rel["method"], page=rel["page"])
         self.graph = g
 
     def component_edges(self):
         by_net = defaultdict(list)
         for rec in self.component_nets:
-            by_net[rec["net"]].append(rec)
+            by_net[(rec["page"], rec["net"])].append(rec)
         rows = []
         seen = set()
-        for net, rows0 in by_net.items():
+        for (page, net), rows0 in by_net.items():
             comps = defaultdict(list)
             for r in rows0:
                 comps[r["component"]].append(r["cluster"])
             refs = sorted(comps)
             for i, a in enumerate(refs):
                 for b in refs[i+1:]:
-                    key = (a, b, net)
+                    key = (a, b, page, net)
                     if key in seen: continue
                     seen.add(key)
-                    rows.append({"source": a, "target": b, "net": net,
+                    rows.append({"source": a, "target": b, "page": page, "net": net,
                                  "source_clusters": ",".join(map(str, sorted(set(comps[a])))),
                                  "target_clusters": ",".join(map(str, sorted(set(comps[b]))))})
         return rows
+
+    def query(self, identifier, min_confidence=0.0):
+        """Return direct and two-hop relations in either direction with provenance."""
+        matches = [n for n, a in self.graph.nodes(data=True)
+                   if n == identifier or a.get("name", "").casefold() == identifier.casefold()]
+        result = []
+        for start in matches:
+            frontier = [(start, [])]
+            visited = {start}
+            for _ in range(2):
+                upcoming = []
+                for node, path in frontier:
+                    for rel in self.relationships:
+                        if rel["confidence"] < min_confidence:
+                            continue
+                        neighbor = (rel["target"] if rel["source"] == node else
+                                    rel["source"] if rel["target"] == node else None)
+                        if neighbor is None or neighbor in visited:
+                            continue
+                        visited.add(neighbor)
+                        next_path = path + [rel]
+                        result.append({"source": start, "target": neighbor, "path": next_path,
+                                       "confidence": min(r["confidence"] for r in next_path)})
+                        upcoming.append((neighbor, next_path))
+                frontier = upcoming
+        return result
 
     def summary(self):
         return {
@@ -978,6 +1123,9 @@ class Extractor:
             "pin_records": len(self.pin_records),
             "pin_tables": len(self.pin_tables),
             "external_links": len(self.external_links),
+            "relationships": len(self.relationships),
+            "channels": len(self.channels), "sites": len(self.sites),
+            "ambiguities": len(self.ambiguities),
         }
 
     # ------------------------------ exports ------------------------------
@@ -995,12 +1143,21 @@ class Extractor:
             "external_links": self.external_links,
             "signal_rows": self.signal_rows,
             "page_profiles": self.page_profiles,
+            "schema_version": "9.0",
+            "coordinate_system": "PyMuPDF page coordinates, points, origin top-left",
+            "raw_text": [dict(w.__dict__, id=f"p{pi}:text:{i}") for pi, words in self.text.items() for i, w in enumerate(words)],
+            "raw_segments": [dict(s.__dict__, id=f"p{pi}:segment:{i}") for pi, segs in self.segments.items() for i, s in enumerate(segs)],
+            "raw_drawings": [d for drawings in self.raw_drawings.values() for d in drawings],
+            "pdf_links": [link for links in self.pdf_links.values() for link in links],
+            "net_islands": self.net_islands, "label_assignments": self.label_assignments,
+            "channels": self.channels, "sites": self.sites,
+            "relationships": self.relationships, "ambiguities": self.ambiguities,
         }
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def export_graphml(self, path):
         # GraphML requires scalar attributes; remove/convert any non-scalars.
-        g = nx.Graph()
+        g = nx.MultiDiGraph()
         for n, attrs in self.graph.nodes(data=True):
             g.add_node(n, **{k: str(v) for k, v in attrs.items()})
         for a, b, attrs in self.graph.edges(data=True):
@@ -1014,7 +1171,7 @@ class Extractor:
             w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(self.component_nets)
 
         with open(str(prefix) + "_component_edges.csv", "w", newline="", encoding="utf-8") as f:
-            rows = self.component_edges(); fields = ["source", "target", "net", "source_clusters", "target_clusters"]
+            rows = self.component_edges(); fields = ["source", "target", "page", "net", "source_clusters", "target_clusters"]
             w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(rows)
 
         with open(str(prefix) + "_unresolved_components.csv", "w", newline="", encoding="utf-8") as f:
@@ -1086,7 +1243,7 @@ class Extractor:
             if not net or net.startswith("_ANON_") or not pin:
                 continue
             endpoint = f"{block}.{pin}" if block else pin
-            by_net[net].add(endpoint)
+            by_net[(r.page, net)].add(endpoint)
 
         # Generic component associations. These are useful for passives and
         # pages where the PDF does not expose an unambiguous pin coordinate.
@@ -1097,20 +1254,20 @@ class Extractor:
                 continue
             # Avoid adding a bare block name if exact pins for that block/net
             # are already present.
-            if not any(x.startswith(comp + ".") for x in by_net[net]):
-                by_net[net].add(comp)
+            if not any(x.startswith(comp + ".") for x in by_net[(r["page"], net)]):
+                by_net[(r["page"], net)].add(comp + " [tentative]")
 
         rows = []
-        for net in sorted(by_net, key=lambda x: (x.upper(), x)):
-            pins = sorted(by_net[net], key=lambda x: (x.upper(), x))
-            rows.append({"Net Name": net, "Net Pins": " ".join(pins),
+        for page, net in sorted(by_net):
+            pins = sorted(by_net[(page, net)], key=lambda x: (x.upper(), x))
+            rows.append({"Page": page, "Net Name": net, "Net Pins": " ".join(pins),
                          "Pin Count": len(pins)})
         return rows
 
     def export_netlist_csv(self, path):
         rows = self.netlist_rows()
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            fields = ["Net Name", "Net Pins", "Pin Count"]
+            fields = ["Page", "Net Name", "Net Pins", "Pin Count"]
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader(); w.writerows(rows)
 
@@ -1138,13 +1295,16 @@ class Extractor:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("pdf", help="input schematic PDF")
-    ap.add_argument("--out-prefix", default="schematic_v6")
+    ap.add_argument("--out-prefix", default="schematic_v9")
+    ap.add_argument("--allow-proximity", action="store_true", help="emit low-confidence component-wire candidates")
+    ap.add_argument("--query", help="print direct and two-hop relationships for a node ID or exact name")
+    ap.add_argument("--min-confidence", type=float, default=0.0)
     ap.add_argument("--viz", action="store_true")
     args = ap.parse_args()
 
     out = Path(args.out_prefix)
     out.parent.mkdir(parents=True, exist_ok=True)
-    ex = Extractor(args.pdf).parse(verbose=True)
+    ex = Extractor(args.pdf, allow_proximity=args.allow_proximity).parse(verbose=True)
     ex.export_json(str(out) + ".json")
     ex.export_graphml(str(out) + ".graphml")
     ex.export_csvs(out)
@@ -1155,6 +1315,8 @@ def main():
         ex.export_overview(str(out) + "_overview.png")
     print("\nExtraction complete")
     print(json.dumps(ex.summary(), indent=2))
+    if args.query:
+        print(json.dumps(ex.query(args.query, args.min_confidence), indent=2))
 
 
 if __name__ == "__main__":
